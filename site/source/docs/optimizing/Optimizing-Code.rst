@@ -31,7 +31,6 @@ In addition to the ``-Ox`` options, there are separate compiler options that can
 .. note::
 
 	-  The meanings of the *emcc* optimization flags (``-O1, -O2`` etc.) are different to the similarly-named options in *gcc*, *clang*, and other compilers, because optimizing JavaScript is very different to optimizing native code. The mapping of the *emcc* levels to the LLVM bitcode optimization levels is documented in the reference.
-	-  If you compile several files into a single JavaScript output, be sure to specify the **same** optimization flags when compiling sources into objects, and objects into JavaScript or HTML. See :ref:`Building-Projects` for more details.
 
 
 Advanced compiler settings
@@ -52,10 +51,10 @@ A few useful flags are:
 
 
 	
-Very large projects
-===================
+Code size
+=========
 
-This section describes optimisations and issues that are only relevant to very large projects.
+This section describes optimisations and issues that are relevant to code size. They are useful both for small projects or libraries where you want the smallest footprint you can achieve, and in large projects where the sheer size may cause issues (like slow startup speed) that you want to avoid.
 
 .. _optimizing-code-memory-initialization:
 
@@ -75,28 +74,68 @@ Trading off code size and performance
 -------------------------------------
 You may wish to build the less performance-sensitive source files in your project using :ref:`-Os <emcc-Os>` or :ref:`-Oz <emcc-Oz>` and the remainder using :ref:`-O2 <emcc-O2>` (:ref:`-Os <emcc-Os>` and :ref:`-Oz <emcc-Oz>` are similar to :ref:`-O2 <emcc-O2>`, but reduce code size at the expense of performance. :ref:`-Oz <emcc-Oz>` reduces code size more than :ref:`-Os <emcc-Os>`.) 
 
-.. note:: This only matters when compiling the source to bitcode. There are currently no JavaScript-specific optimization flags for ``-Os`` or ``-Oz``, and these map to ``-O2`` in the bitcode-to-JavaScript phase.
+Note that ``-Oz`` may take longer to build. For example, it enables ``EVAL_CTORS`` which tries to optimize out C++ global constructors, which takes time.
 
-Code size
----------
+Miscellaneous code size tips
+----------------------------
 
-Tips for reducing code size include:
+In addition to the above (defining a separate memory initialization file as :ref:`mentioned above <optimizing-code-memory-initialization>`, and using ``-Os`` or ``-Oz``  as :ref:`mentioned above <optimizing-code-oz-os>`), the following tips can help to reduce code size:
 
-- Define a separate memory initialization file (as :ref:`mentioned above <optimizing-code-memory-initialization>`).
-- Use ``-Os`` or ``-Oz``  (as :ref:`mentioned above <optimizing-code-oz-os>`).
-- Build bitcode to JavaScript with :ref:`-O3 <emcc-O3>`. This runs the expensive variable reuse pass (``registerizeHarder``). It is even more effective than ``-O2`` but slower to compile.
+- `Floh's blogpost on this topic <http://floooh.github.io/2016/08/27/asmjs-diet.html>`_ is very helpful.
 - Use :ref:`llvm-lto <emcc-llvm-lto>` when compiling from bitcode to JavaScript: ``--llvm-lto 1``. This can break some code as the LTO code path is less tested.
 - Disable :ref:`optimizing-code-inlining`: ``-s INLINING_LIMIT=1``. Compiling with -Os or -Oz generally avoids inlining too.
 - Use :ref:`closure <emcc-closure>` on the outside non-asm.js code: ``--closure 1``. This can break code that doesn't use `closure annotations properly <https://developers.google.com/closure/compiler/docs/api-tutorial3>`_.
+- You can use the ``NO_FILESYSTEM`` option to disable bundling of filesystem support code (the compiler should optimize it out if not used, but may not always succeed). This can be useful if you are building a pure computational library, for example. See ``settings.js`` for more details.
+- You can use ``EXPORTED_RUNTIME_METHODS`` to define which runtime methods are exported. By default a bunch of useful methods are exported, which you may not need; setting this to a smaller list will cause fewer methods to be exported. In conjunction with the closure compiler, this can be very effective, since closure can eliminate non-exported code. See ``settings.js`` for more details. See ``test_no_nuthin`` in ``tests/test_other.py`` for an example usage in the test suite.
+- You can use ``ELIMINATE_DUPLICATE_FUNCTIONS`` to remove duplicate functions, which C++ templates often create. See ``settings.js`` for more details.
+- You can move some of your code into the `Emterpreter <https://github.com/kripken/emscripten/wiki/Emterpreter>`_, which will then run much slower (as it is interpreted), but it will transfer all that code into a smaller amount of data.
+- You can use separate modules through `dynamic linking <https://github.com/kripken/emscripten/wiki/Linking>`_. That can increase the total code size of everything, but reduces the maximum size of a single module, which can help in some cases (e.g. if a single big module hits a memory limit).
+
+Very large codebases
+====================
+
+The previous section on reducing code size can be helpful on very large codebases. In addition, here are some other topics that might be useful.
+
+.. _optimizing-code-separating_asm:
+
+Avoid memory spikes by separating out asm.js
+--------------------------------------------
+
+By default Emscripten emits one JS file, containing the entire codebase: Both the asm.js code that was compiled, and the general code that sets up the environment, connects to browser APIs, etc. in a very large codebase, this can be inefficient in terms of memory usage, as having all of that in one script means the JS engine might use some memory to parse and compile the asm.js, and might not free it before starting to run the codebase. And in a large game, starting to run the code might allocate a large typed array for memory, so you might see a "spike" of memory, after which temporary compilation memory will be freed. And if big enough, that spike can cause the browser to run out of memory and fail to load the application. This is a known problem on `Chrome <https://code.google.com/p/v8/issues/detail?id=4392>`_ (other browsers do not seem to have this issue).
+
+A workaround is to separate out the asm.js into another file, and to make sure that the browser has a turn of the event loop between compiling the asm.js module and starting to run the application. This can be achieved by running **emcc** with ``--separate-asm``.
+
+You can also do this manually, as follows:
+
+ * Run ``tools/separate_asm.py``. This receives as inputs the filename of the full project, and two filenames to emit: the asm.js file and a file for everything else.
+ * Load the asm.js script first, then after a turn of the event loop, the other one, for example using code like this in your HTML file:
+   ::
+      var script = document.createElement('script');
+      script.src = "the_asm.js";
+      script.onload = function() {
+        setTimeout(function() {
+          var script = document.createElement('script');
+          script.src = "the_rest.js";
+          document.body.appendChild(script);
+        }, 1); // delaying even 1ms is enough
+      };
+      document.body.appendChild(script);
+
 
 .. _optimizing-code-outlining:
+
+Running by itself
+-----------------
+
+If you hit memory limits in browsers, it can help to run your project by itself, as opposed to inside a web page containing other content. If you open a new web page (as a new tab, or a new window) that contains just your project, then you have the best chance at avoiding memory fragmentation issues.
+
 
 Outlining
 ---------
 
 JavaScript engines will often compile very large functions slowly (relative to their size), and fail to optimize them effectively (or at all). One approach to this problem is to use "outlining": breaking them into smaller functions that can be compiled and optimized more effectively. 
 
-Outlining increases overall code size, and can itself make some code less optimised. Despite this, outlining can sometimes improve both startup and runtime speed. For more information see For more information read `Outlining: a workaround for JITs and big functions <http://mozakai.blogspot.com/2013/08/outlining-workaround-for-jits-and-big.html>`_.
+Outlining increases overall code size, and can itself make some code less optimised. Despite this, outlining can sometimes improve both startup and runtime speed. For more information read `Outlining: a workaround for JITs and big functions <http://mozakai.blogspot.com/2013/08/outlining-workaround-for-jits-and-big.html>`_.
 
 The ``OUTLINING_LIMIT`` setting defines the function size at which Emscripten will try to break large functions into smaller ones. Search for this setting in `settings.js <https://github.com/kripken/emscripten/blob/master/src/settings.js>`_ for information on how to determine what functions may need to be outlined and how to choose an appropriate function size.
 

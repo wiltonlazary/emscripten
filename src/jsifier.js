@@ -85,7 +85,10 @@ function JSify(data, functionsOnly) {
   }
 
   function processLibraryFunction(snippet, ident, finalName) {
-    snippet = snippet.toString();
+    // It is possible that when printing the function as a string on Windows, the js interpreter we are in returns the string with Windows
+    // line endings \r\n. This is undesirable, since line endings are managed in the form \n in the output for binary file writes, so
+    // make sure the endings are uniform.
+    snippet = snippet.toString().replace(/\r\n/gm,"\n");
     assert(snippet.indexOf('XXX missing C define') == -1,
            'Trying to include a library function with missing C defines: ' + finalName + ' | ' + snippet);
 
@@ -100,12 +103,20 @@ function JSify(data, functionsOnly) {
 
   // functionStub
   function functionStubHandler(item) {
+    // special logic
+    if (item.ident.startsWith('___cxa_find_matching_catch_')) {
+      var num = +item.ident.split('_').slice(-1)[0];
+      LibraryManager.library[item.ident.substr(1)] = function() {
+        return ___cxa_find_matching_catch.apply(null, arguments);
+      };
+    }
+
     // note the signature
     if (item.returnType && item.params) {
       functionStubSigs[item.ident] = Functions.getSignature(item.returnType.text, item.params.map(function(arg) { return arg.type }), false);
     }
 
-    function addFromLibrary(ident, notDep) {
+    function addFromLibrary(ident) {
       if (ident in addedLibraryItems) return '';
       addedLibraryItems[ident] = true;
 
@@ -126,10 +137,12 @@ function JSify(data, functionsOnly) {
       var noExport = false;
 
       if ((!LibraryManager.library.hasOwnProperty(ident) && !LibraryManager.library.hasOwnProperty(ident + '__inline')) || SIDE_MODULE) {
-        if (notDep) {
+        if (!(finalName in IMPLEMENTED_FUNCTIONS)) {
           if (VERBOSE || ident.substr(0, 11) !== 'emscripten_') { // avoid warning on emscripten_* functions which are for internal usage anyhow
-            if (ERROR_ON_UNDEFINED_SYMBOLS) error('unresolved symbol: ' + ident);
-            else if (VERBOSE || (WARN_ON_UNDEFINED_SYMBOLS && !LINKABLE)) warn('unresolved symbol: ' + ident);
+            if (!LINKABLE) {
+              if (ERROR_ON_UNDEFINED_SYMBOLS) error('unresolved symbol: ' + ident);
+              else if (VERBOSE || WARN_ON_UNDEFINED_SYMBOLS) warn('unresolved symbol: ' + ident);
+            }
           }
         }
         if (!(MAIN_MODULE || SIDE_MODULE)) {
@@ -185,7 +198,7 @@ function JSify(data, functionsOnly) {
         addedLibraryItems[postsetId] = true;
         itemsDict.GlobalVariablePostSet.push({
           intertype: 'GlobalVariablePostSet',
-          JS: postset
+          JS: postset + ';'
         });
       }
 
@@ -244,7 +257,7 @@ function JSify(data, functionsOnly) {
           delete LibraryManager.library[shortident + '__deps'];
         }
       }
-      item.JS = addFromLibrary(shortident, true);
+      item.JS = addFromLibrary(shortident);
     }
   }
 
@@ -282,8 +295,14 @@ function JSify(data, functionsOnly) {
           print('STATIC_BASE = ' + Runtime.GLOBAL_BASE + ';\n');
           print('STATICTOP = STATIC_BASE + ' + Runtime.alignMemory(Variables.nextIndexedOffset) + ';\n');
         } else {
-          print('gb = getMemory({{{ STATIC_BUMP }}});\n');
+          print('gb = Runtime.alignMemory(getMemory({{{ STATIC_BUMP }}}, ' + MAX_GLOBAL_ALIGN + ' || 1));\n');
           print('// STATICTOP = STATIC_BASE + ' + Runtime.alignMemory(Variables.nextIndexedOffset) + ';\n'); // comment as metadata only
+        }
+        if (BINARYEN) {
+          // export static base and bump, needed for linking in wasm binary's memory, dynamic linking, etc.
+          print('var STATIC_BUMP = {{{ STATIC_BUMP }}};');
+          print('Module["STATIC_BASE"] = STATIC_BASE;');
+          print('Module["STATIC_BUMP"] = STATIC_BUMP;');
         }
       }
       var generated = itemsDict.function.concat(itemsDict.type).concat(itemsDict.GlobalVariableStub).concat(itemsDict.GlobalVariable);
@@ -326,9 +345,9 @@ function JSify(data, functionsOnly) {
           print('var tempDoublePtr;\n');
           print('if (!ENVIRONMENT_IS_PTHREAD) tempDoublePtr = Runtime.alignMemory(allocate(12, "i8", ALLOC_STATIC), 8);\n');
         } else {
-          print('var tempDoublePtr = Runtime.alignMemory(allocate(12, "i8", ALLOC_STATIC), 8);\n');
+          print('var tempDoublePtr = ' + makeStaticAlloc(8) + '\n');
         }
-        print('assert(tempDoublePtr % 8 == 0);\n');
+        if (ASSERTIONS) print('assert(tempDoublePtr % 8 == 0);\n');
         print('function copyTempFloat(ptr) { // functions, because inlining this code increases code size too much\n');
         print('  HEAP8[tempDoublePtr] = HEAP8[ptr];\n');
         print('  HEAP8[tempDoublePtr+1] = HEAP8[ptr+1];\n');
@@ -365,11 +384,19 @@ function JSify(data, functionsOnly) {
     legalizedI64s = legalizedI64sDefault;
 
     if (!BUILD_AS_SHARED_LIB && !SIDE_MODULE) {
+      if (USE_PTHREADS) print('if (!ENVIRONMENT_IS_PTHREAD) {\n // Only main thread initializes these, pthreads copy them over at thread worker init time (in pthread-main.js)');
+      print('DYNAMICTOP_PTR = allocate(1, "i32", ALLOC_STATIC);\n');
       print('STACK_BASE = STACKTOP = Runtime.alignMemory(STATICTOP);\n');
-      print('staticSealed = true; // seal the static portion of memory\n');
+      if (STACK_START > 0) print('if (STACKTOP < ' + STACK_START + ') STACK_BASE = STACKTOP = Runtime.alignMemory(' + STACK_START + ');\n');
       print('STACK_MAX = STACK_BASE + TOTAL_STACK;\n');
-      print('DYNAMIC_BASE = DYNAMICTOP = Runtime.alignMemory(STACK_MAX);\n');
-      print('assert(DYNAMIC_BASE < TOTAL_MEMORY, "TOTAL_MEMORY not big enough for stack");\n');
+      print('DYNAMIC_BASE = Runtime.alignMemory(STACK_MAX);\n');
+      print('HEAP32[DYNAMICTOP_PTR>>2] = DYNAMIC_BASE;\n');
+      print('staticSealed = true; // seal the static portion of memory\n');
+      if (ASSERTIONS) print('assert(DYNAMIC_BASE < TOTAL_MEMORY, "TOTAL_MEMORY not big enough for stack");\n');
+      if (USE_PTHREADS) print('}\n');
+    }
+    if (SPLIT_MEMORY) {
+      print('assert(STACK_MAX < SPLIT_MEMORY, "SPLIT_MEMORY size must be big enough so the entire static memory + stack can fit in one chunk, need " + STACK_MAX);\n');
     }
 
     if (asmLibraryFunctions.length > 0) {
@@ -387,42 +414,7 @@ function JSify(data, functionsOnly) {
     // This is the main 'post' pass. Print out the generated code that we have here, together with the
     // rest of the output that we started to print out earlier (see comment on the
     // "Final shape that will be created").
-    if (PRECISE_I64_MATH && (Types.preciseI64MathUsed || PRECISE_I64_MATH == 2)) {
-      if (SIDE_MODULE) {
-        print('// ASM_LIBRARY FUNCTIONS'); // fastLong.js etc. code is indeed asm library code
-      }
-      if (!INCLUDE_FULL_LIBRARY) {
-        // first row are utilities called from generated code, second are needed from fastLong
-        ['i64Add', 'i64Subtract', 'bitshift64Shl', 'bitshift64Lshr', 'bitshift64Ashr',
-         'llvm_cttz_i32'].forEach(function(ident) {
-          var finalName = '_' + ident;
-          if (!Functions.libraryFunctions[finalName] || (ident[0] === 'l' && !addedLibraryItems[ident])) { // TODO: one-by-one in fastcomp glue mode
-            print(processLibraryFunction(LibraryManager.library[ident], ident, finalName)); // must be first to be close to generated code
-            Functions.implementedFunctions[finalName] = LibraryManager.library[ident + '__sig'];
-            Functions.libraryFunctions[finalName] = 2; // XXX
-            // limited dependency handling
-            var deps = LibraryManager.library[ident + '__deps'];
-            if (deps) {
-              deps.forEach(function(dep) {
-                assert(typeof dep == 'function');
-                var text = dep();
-                assert(text.indexOf('\n') < 0);
-                text = text.replace('ALLOC_STATIC', 'ALLOC_DYNAMIC');
-                print('/* PRE_ASM */ ' + text + '\n');
-              });
-            }
-          }
-        });
-      }
-      // these may be duplicated in side modules and the main module without issue
-      print(processMacros(read('fastLong.js')));
-      print('// EMSCRIPTEN_END_FUNCS\n');
-      print(read('long.js'));
-    } else {
-      print('// EMSCRIPTEN_END_FUNCS\n');
-      print('// Warning: printing of i64 values may be slightly rounded! No deep i64 math used, so precise i64 code not included');
-      print('var i64Math = null;');
-    }
+    print('// EMSCRIPTEN_END_FUNCS\n');
 
     if (HEADLESS) {
       print('if (!ENVIRONMENT_IS_WEB) {');
@@ -434,7 +426,7 @@ function JSify(data, functionsOnly) {
     if (PROXY_TO_WORKER) {
       print('if (ENVIRONMENT_IS_WORKER) {\n');
       print(read('webGLWorker.js'));
-      print(read('proxyWorker.js'));
+      print(processMacros(preprocess(read('proxyWorker.js'), 'proxyWorker.js')));
       print('}');
     }
     if (DETERMINISTIC) {

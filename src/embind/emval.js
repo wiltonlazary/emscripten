@@ -2,7 +2,7 @@
 /*global HEAP32*/
 /*global new_*/
 /*global createNamedFunction*/
-/*global readLatin1String, writeStringToMemory*/
+/*global readLatin1String, stringToUTF8*/
 /*global requireRegisteredType, throwBindingError, runDestructors*/
 /*jslint sub:true*/ /* The symbols 'fromWireType' and 'toWireType' must be accessed via array notation to be closure-safe since craftInvokerFunction crafts functions as strings that can't be closured. */
 
@@ -38,7 +38,7 @@ var LibraryEmVal = {
 
   $get_first_emval__deps: ['$emval_handle_array'],
   $get_first_emval: function() {
-    for (var i = 1; i < emval_handle_array.length; ++i) {
+    for (var i = 5; i < emval_handle_array.length; ++i) {
         if (emval_handle_array[i] !== undefined) {
             return emval_handle_array[i];
         }

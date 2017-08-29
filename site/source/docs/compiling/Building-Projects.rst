@@ -48,8 +48,6 @@ To build with Emscripten, you would instead use the following commands:
 
 	The file output from *make* might have a different suffix: **.a** for a static library archive, **.so** for a shared library, **.o** or **.bc** for object files (these file extensions are the same as *gcc* would use for the different types). Irrespective of the file extension, these files contain linked LLVM bitcode that *emcc* can compile into JavaScript in the final step.
 
-	Where possible it is better to generate shared library files (**.so**) rather than archives (**.a**) — this is generally a simple change in your project's build system. Shared libraries are simpler, and are more predictable with respect to linking and elimination of unneeded code. 
-
 The last step is to compile the linked bitcode into JavaScript. We do this by calling *emcc* again, specifying the linked LLVM bitcode file as an input, and a JavaScript file as the output.
 
 
@@ -176,7 +174,9 @@ Emscripten Ports is a collection of useful libraries, ported to Emscripten. They
 
 You should see some notifications about SDL2 being used, and built if it wasn't previously. You can then view ``sdl2.html`` in your browser.
 
-.. note:: *SDL_image* has also been added to ports, use it with ``-s USE_SDL_IMAGE=2``. To see a list of all available ports, run ``emcc --show-ports``.
+.. note:: *SDL_image* has also been added to ports, use it with ``-s USE_SDL_IMAGE=2``. To see a list of all available ports, run ``emcc --show-ports``. For SDL2_image to be useful, you generally need to specify the image formats you are planning on using with -s SDL2_IMAGE_FORMATS='["png"]'. This will also ensure that ``IMG_Init`` works properly. Alternatively, you can use specify ``emcc --use-preload-plugins`` (and ``--preload-file`` your images, so the browser codecs decode them), but then your calls to ``IMG_Init`` will fail.
+
+.. note:: *SDL_net* has also been added to ports, use it with ``-s USE_SDL_NET=2``. To see a list of all available ports, run ``emcc --show-ports``.
 
 .. note:: Emscripten also has support for older SDL1, which is built-in. If you do not specify SDL2 as in the command above, then SDL1 is linked in and the SDL1 include paths are used. SDL1 has support for *sdl-config*, which is present in `system/bin <https://github.com/kripken/emscripten/blob/master/system/bin/sdl-config>`_. Using the native *sdl-config* may result in compilation or missing-symbol errors. You will need to modify the build system to look for files in **emscripten/system** or **emscripten/system/bin** in order to use the Emscripten *sdl-config*.
 
@@ -207,25 +207,11 @@ In some cases it makes sense to modify the build scripts so that they build the 
 Dynamic linking
 ---------------
 
-Emscripten's goal is to generate the fastest and smallest possible code, and for that reason it focuses on generating a single JavaScript file for an entire project. 
+Emscripten's goal is to generate the fastest and smallest possible code, and for that reason it focuses on generating a single JavaScript file for an entire project. For that reason, dynamic linking should be avoided when possible.
 
-Dynamic linking at runtime is not supported when using :ref:`Fastcomp <LLVM-Backend>` (it won't link in code from an arbitrary location when an app is loaded).
+By default, Emscripten ``.so`` files are the same as ``.bc`` or ``.o`` files, that is, they contain LLVM bitcode. Dynamic libraries that you specify in the final build stage (when generating JavaScript or HTML) are linked in as static libraries. *Emcc* ignores commands to dynamically link libraries when linking together bitcode (i.e., not in the final build stage). This is to ensure that the same dynamic library is not linked multiple times in intermediate build stages, which would result in duplicate symbol errors.
 
-.. note:: Dynamic linking would be an excellent :ref:`contribution <Contributing>` to Emscripten.
-
-Dynamic linking is supported when using the :ref:`original compiler <original-compiler-core>` but is **not** recommended.
-
-
-.. _building-projects-dynamic-linking-workaround:
-
-Pseudo-Dynamic linking
----------------------------
-
-.. note:: This section applies to the :ref:`current compiler <LLVM-Backend>` only. It is a workaround because *Fastcomp* does not support true dynamic linking.
-
-Dynamic libraries that you specify in the final build stage (when generating JavaScript or HTML) are linked in as static libraries. 
-
-*Emcc* ignores commands to dynamically link libraries when linking together bitcode. This is to ensure that the same dynamic library is not linked multiple times in intermediate build stages, which would result in duplicate symbol errors.
+There is `experimental support <https://github.com/kripken/emscripten/wiki/Linking>`_ for true dynamic libraries, loaded as runtime, either via dlopen or as a shared library. See that link for the details and limitations.
 
 
 Configure may run checks that appear to fail
@@ -237,6 +223,15 @@ Projects that use *configure*, *cmake*, or some other portable configuration met
 
 .. note:: In general *configure* is not a good match for a cross-compiler like Emscripten. *configure* is designed to build natively for the local setup, and works hard to find the native build system and the local system headers. With a cross-compiler, you are targeting a different system, and ignoring these headers etc.
 
+
+Archive (.a) files
+------------------
+
+Emscripten supports **.a** archive files, which are bundles of object files. This is an old format for libraries, and it has special semantics - for example, the order of linking matters with **.a** files, but not with plain object files (in **.bc**, **.o** or **.so**). For the most part those special semantics should work in Emscripten, however, we support **.a** files using llvm's tools, which have a few limitations.
+
+The main limitation is that if you have multiple files in a single **.a** archive that have the same basename (for example, ``dir1/a.o, dir2/a.o``), then llvm-ar cannot access both of those files. Emscripten will attempt to work around this by adding a hash to the basename, but collisions are still possible in principle.
+
+Where possible it is better to generate shared library files (**.so**) rather than archives (**.a**) — this is generally a simple change in your project's build system. Shared libraries are simpler, and are more predictable with respect to linking.
 
 
 Manually using emcc
@@ -273,17 +268,22 @@ The :ref:`Tutorial` showed how :ref:`emcc <emccdoc>` can be used to compile sing
 In addition to the capabilities it shares with *gcc*, *emcc* supports options to optimize code, control what debug information is emitted, generate HTML and other output formats, etc. These options are documented in the :ref:`emcc tool reference <emccdoc>` (``./emcc --help`` on the command line).
 
 
-Alternatives to emcc
-====================
+Detecting Emscripten in Preprocessor
+====================================
 
-.. tip:: Do not attempt to bypass *emcc* and call the Emscripten tools directly from your build system. 
+Emscripten provides the following preprocessor macros that can be used to identify the compiler version and platform:
 
-You can in theory call *clang*, *llvm-ld*, and the other tools yourself. This is however considered dangerous because by default:
-
-- *Clang* does not use the Emscripten-bundled headers, which can lead to various errors. 
-- *llvm-ld* uses unsafe/unportable LLVM optimizations. 
-
-*Emcc* automatically ensures the tools are configured and used properly.
+ * The preprocessor define ``__EMSCRIPTEN__`` is always defined when compiling programs with Emscripten.
+ * The preprocessor variables ``__EMSCRIPTEN_major__``, ``__EMSCRIPTEN_minor__`` and ``__EMSCRIPTEN_tiny__`` specify, as integers, the currently used Emscripten compiler version.
+ * Emscripten behaves like a variant of Unix, so the preprocessor defines ``unix``, ``__unix`` and ``__unix__`` are always present when compiling code with Emscripten.
+ * Emscripten uses Clang/LLVM as its underlying codegen compiler, so the preprocessor defines ``__llvm__`` and ``__clang__`` are defined, and the preprocessor defines ``__clang_major__``, ``__clang_minor__`` and ``__clang_patchlevel__`` indicate the version of Clang that is used.
+ * Clang/LLVM is GCC-compatible, so the preprocessor defines ``__GNUC__``, ``__GNUC_MINOR__`` and ``__GNUC_PATCHLEVEL__`` are also defined to represent the level of GCC compatibility that Clang/LLVM provides.
+ * The preprocessor string ``__VERSION__`` indicates the GCC compatible version, which is expanded to also show Emscripten version information.
+ * Likewise, ``__clang_version__`` is present and indicates both Emscripten and LLVM version information.
+ * Emscripten is a 32-bit platform, so ``size_t`` is a 32-bit unsigned integer, ``__POINTER_WIDTH__=32``, ``__SIZEOF_LONG__=4`` and ``__LONG_MAX__`` equals ``2147483647L``.
+ * When targeting asm.js, the preprocessor defines ``__asmjs`` and ``__asmjs__`` are present.
+ * When targeting SSEx SIMD APIs using one of the command line compiler flags ``-msse``, ``-msse2``, ``-msse3``, ``-mssse3``, or ``-msse4.1``, one or more of the preprocessor flags ``__SSE__``, ``__SSE2__``, ``__SSE3__``, ``__SSSE3__``, ``__SSE4_1__`` will be present to indicate available support for these instruction sets.
+ * If targeting the pthreads multithreading support with the compiler & linker flag ``-s USE_PTHREADS=1``, the preprocessor define ``__EMSCRIPTEN_PTHREADS__`` will be present.
 
 
 Examples / test code

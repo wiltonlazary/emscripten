@@ -48,7 +48,9 @@ Defines
 	Input-output versions of EM_ASM.
  	
 	:c:macro:`EM_ASM_` (an extra "_" is added) or :c:macro:`EM_ASM_ARGS` allow values (``int`` or ``double``) to be sent into the code.
-	
+
+	.. note:: The C preprocessor does not have a full understanding of JavaScript tokens, of course. An issue you might see is that it is not aware of nesting due to ``{`` or ``[``, it is only aware of ``,`` and ``(``. As a result, if you have a JavaScript array ``[1,2,3]`` then you might get an error, but can fix things with parentheses: ``([1,2,3])``.
+
 	If you also want a return value, :c:macro:`EM_ASM_INT` receives arguments (of ``int`` or ``double`` type) and returns an ``int``; :c:macro:`EM_ASM_DOUBLE` does the same and returns a ``double``.
 	
 	Arguments arrive as ``$0``, ``$1`` etc. The output value should be returned: ::
@@ -110,7 +112,7 @@ Functions
 
 .. c:function:: void emscripten_run_script(const char *script)
 
-	Interface to the underlying JavaScript engine. This function will ``eval()`` the given script. 
+	Interface to the underlying JavaScript engine. This function will ``eval()`` the given script. Note: If -s NO_DYNAMIC_EXECUTION=1 is set, this function will not be available.
 
 	:param script: The script to evaluate.
 	:type script: const char* 
@@ -119,7 +121,7 @@ Functions
 	
 .. c:function:: int emscripten_run_script_int(const char *script)
 
-	Interface to the underlying JavaScript engine. This function will ``eval()`` the given script. 
+	Interface to the underlying JavaScript engine. This function will ``eval()`` the given script. Note: If -s NO_DYNAMIC_EXECUTION=1 is set, this function will not be available.
 
 	:param script: The script to evaluate.
 	:type script: const char* 
@@ -129,7 +131,7 @@ Functions
 	
 .. c:function:: char *emscripten_run_script_string(const char *script)
 
-	Interface to the underlying JavaScript engine. This function will ``eval()`` the given script. Note that this overload uses a single buffer shared between calls.
+	Interface to the underlying JavaScript engine. This function will ``eval()`` the given script. Note that this overload uses a single buffer shared between calls. Note: If -s NO_DYNAMIC_EXECUTION=1 is set, this function will not be available.
 
 	:param script: The script to evaluate.
 	:type script: const char* 
@@ -245,17 +247,18 @@ Functions
 
 	This function can be used to interactively control the rate at which Emscripten runtime drives the main loop specified by calling the function :c:func:`emscripten_set_main_loop`. In native development, this corresponds with the "swap interval" or the "presentation interval" for 3D rendering. The new tick interval specified by this function takes effect immediately on the existing main loop, and this function must be called only after setting up a main loop via :c:func:`emscripten_set_main_loop`.
 
-    :param int mode: The timing mode to use. Allowed values are EM_TIMING_SETTIMEOUT, EM_TIMING_RAF.
+    :param int mode: The timing mode to use. Allowed values are EM_TIMING_SETTIMEOUT, EM_TIMING_RAF and EM_TIMING_SETIMMEDIATE.
 
 	:param int value: The timing value to activate for the main loop. This value interpreted differently according to the ``mode`` parameter:
 
 	   - If ``mode`` is EM_TIMING_SETTIMEOUT, then ``value`` specifies the number of milliseconds to wait between subsequent ticks to the main loop and updates occur independent of the vsync rate of the display (vsync off). This method uses the JavaScript ``setTimeout`` function to drive the animation.
 	   - If ``mode`` is EM_TIMING_RAF, then updates are performed using the ``requestAnimationFrame`` function (with vsync enabled), and this value is interpreted as a "swap interval" rate for the main loop. The value of ``1`` specifies the runtime that it should render at every vsync (typically 60fps), whereas the value ``2`` means that the main loop callback should be called only every second vsync (30fps). As a general formula, the value ``n`` means that the main loop is updated at every n'th vsync, or at a rate of ``60/n`` for 60Hz displays, and ``120/n`` for 120Hz displays.
+	   - If ``mode`` is EM_TIMING_SETIMMEDIATE, then updates are performed using the ``setImmediate`` function, or if not available, emulated via ``postMessage``. See `setImmediate on MDN <https://developer.mozilla.org/en-US/docs/Web/API/Window/setImmediate>` for more information. Note that this mode is **strongly not recommended** to be used when deploying Emscripten output to the web, since it depends on an unstable web extension that is in draft status, browsers other than IE do not currently support it, and its implementation has been considered controversial in review.
 
 	:rtype: int
 	:return: The value 0 is returned on success, and a nonzero value is returned on failure. A failure occurs if there is no main loop active before calling this function.
 
-	.. note:: Browsers heavily optimize towards using ``requestAnimationFrame`` for animation instead of ``setTimeout``. Because of that, for best experience across browsers, calling this function with ``mode=EM_TIMING_RAF`` and ``value=1`` will yield best results. Using the JavaScript ``setTimeout`` function is known to cause stutter and generally worse experience than using the ``requestAnimationFrame`` function.
+	.. note:: Browsers heavily optimize towards using ``requestAnimationFrame`` for animation instead of the other provided modes. Because of that, for best experience across browsers, calling this function with ``mode=EM_TIMING_RAF`` and ``value=1`` will yield best results. Using the JavaScript ``setTimeout`` function is known to cause stutter and generally worse experience than using the ``requestAnimationFrame`` function.
 
 	.. note:: There is a functional difference between ``setTimeout`` and ``requestAnimationFrame``: If the user minimizes the browser window or hides your application tab, browsers will typically stop calling ``requestAnimationFrame`` callbacks, but ``setTimeout``-based main loop will continue to be run, although with heavily throttled intervals. See `setTimeout on MDN <https://developer.mozilla.org/en-US/docs/Web/API/WindowTimers.setTimeout#Inactive_tabs>` for more information.
 
@@ -314,7 +317,7 @@ Functions
 	:rtype: double
 	:return: The pixel ratio or 1.0 if not supported.
 
-.. c:function::void emscripten_hide_mouse(void)
+.. c:function:: void emscripten_hide_mouse(void)
 
 	Hide the OS mouse cursor over the canvas.
 
@@ -422,13 +425,13 @@ Typedefs
 		typedef void (*em_async_wget2_data_onprogress_func)(void*, int, int)
 
 		
-.. c:type:: em_async_prepare_data_onload_func
+.. c:type:: em_run_preload_plugins_data_onload_func
 
-	Function pointer type for the ``onload`` callback of :c:func:`emscripten_async_prepare_data` (specific values of the parameters documented in that method).
+	Function pointer type for the ``onload`` callback of :c:func:`emscripten_run_preload_plugins_data` (specific values of the parameters documented in that method).
 
 	Defined as: :: 
 
-		typedef void (*em_async_prepare_data_onload_func)(void*, const char*)	
+		typedef void (*em_run_preload_plugins_data_onload_func)(void*, const char*)	
 
 	
 
@@ -439,26 +442,26 @@ Functions
 
 	Load file from url in *synchronously*. For the asynchronous version, see the :c:func:`emscripten_async_wget`.
 
-	In addition to fetching the URL from the network, the contents are prepared so that the data is usable in ``IMG_Load`` and so forth (we synchronously do the work to make the browser decode the image or audio etc.).
+	In addition to fetching the URL from the network, preload plugins are executed so that the data is usable in ``IMG_Load`` and so forth (we synchronously do the work to make the browser decode the image or audio etc.).
  
 	This function is blocking; it won't return until all operations are finished. You can then open and read the file if it succeeded.
 
 	To use this function, you will need to compile your application with the linker flag ``-s ASYNCIFY=1``
 
 	:param const char* url: The URL to load.
-	:param const char* file: The name of the file created and loaded from the URL. If the file already exists it will be overwritten.
+	:param const char* file: The name of the file created and loaded from the URL. If the file already exists it will be overwritten. If the destination directory for the file does not exist on the filesystem, it will be created. A relative pathname may be passed, which will be interpreted relative to the current working directory at the time of the call to this function.
 
 	
 .. c:function:: void emscripten_async_wget(const char* url, const char* file, em_str_callback_func onload, em_str_callback_func onerror)
 		 
 	Loads a file from a URL asynchronously. 
 
-	In addition to fetching the URL from the network, the contents are prepared so that the data is usable in ``IMG_Load`` and so forth (we asynchronously do the work to make the browser decode the image or audio etc.).
+	In addition to fetching the URL from the network, preload plugins are executed so that the data is usable in ``IMG_Load`` and so forth (we asynchronously do the work to make the browser decode the image or audio etc.).
 
 	When the file is ready the ``onload`` callback will be called. If any error occurs ``onerror`` will be called. The callbacks are called with the file as their argument.
 	
 	:param const char* url: The URL to load.
-	:param const char* file: The name of the file created and loaded from the URL. If the file already exists it will be overwritten.
+	:param const char* file: The name of the file created and loaded from the URL. If the file already exists it will be overwritten. If the destination directory for the file does not exist on the filesystem, it will be created. A relative pathname may be passed, which will be interpreted relative to the current working directory at the time of the call to this function.
 	:param em_str_callback_func onload: Callback on successful load of the file. The callback function parameter value is:	
 	
 		- *(const char*)* : The name of the ``file`` that was loaded from the URL.
@@ -475,7 +478,7 @@ Functions
 	
 	This is the "data" version of :c:func:`emscripten_async_wget`.  
 
-	Instead of writing to a file, this function writes to a buffer directly in memory. This avoids the overhead of using the emulated file system; note however that since files are not used, it cannot do the 'prepare' stage to set things up for ``IMG_Load`` and so forth (``IMG_Load`` etc. work on files).
+	Instead of writing to a file, this function writes to a buffer directly in memory. This avoids the overhead of using the emulated file system; note however that since files are not used, it cannot run preload plugins to set things up for ``IMG_Load`` and so forth (``IMG_Load`` etc. work on files).
 
 	When the file is ready then the ``onload`` callback will be called. If any error occurred ``onerror`` will be called.
 	
@@ -499,13 +502,13 @@ Functions
 	
 	This is an **experimental** "more feature-complete" version of :c:func:`emscripten_async_wget`. 
 	
-	In addition to fetching the URL from the network, the contents are prepared so that the data is usable in ``IMG_Load`` and so forth (we asynchronously do the work to make the browser decode the image, audio, etc.).
+	In addition to fetching the URL from the network, preload plugins are executed so that the data is usable in ``IMG_Load`` and so forth (we asynchronously do the work to make the browser decode the image, audio, etc.).
 
 	When the file is ready the ``onload`` callback will be called with the object pointers given in ``arg`` and ``file``. During the download the ``onprogress`` callback is called.
 	
 	:param url: The URL of the file to load.
 	:type url: const char* 
-	:param file: The name of the file created and loaded from the URL. If the file already exists it will be overwritten.
+	:param file: The name of the file created and loaded from the URL. If the file already exists it will be overwritten. If the destination directory for the file does not exist on the filesystem, it will be created. A relative pathname may be passed, which will be interpreted relative to the current working directory at the time of the call to this function.
 	:type file: const char* 
 	:param requesttype: 'GET' or 'POST'.
 	:type requesttype: const char* 	
@@ -536,10 +539,8 @@ Functions
 	
 	This is the "data" version of :c:func:`emscripten_async_wget2`. It is an **experimental** "more feature complete" version of :c:func:`emscripten_async_wget_data`. 	
 
-	Instead of writing to a file, this function writes to a buffer directly in memory. This avoids the overhead of using the emulated file system; note however that since files are not used, it cannot do the 'prepare' stage to set things up for ``IMG_Load`` and so forth (``IMG_Load`` etc. work on files).
+	Instead of writing to a file, this function writes to a buffer directly in memory. This avoids the overhead of using the emulated file system; note however that since files are not used, it cannot run preload plugins to set things up for ``IMG_Load`` and so forth (``IMG_Load`` etc. work on files).
 	
-	In addition to fetching the URL from the network, the contents are prepared so that the data is usable in ``IMG_Load`` and so forth (we asynchronously do the work to make the browser decode the image or audio etc.).
-
 	When the file is ready the ``onload`` callback will be called with the object pointers given in ``arg``, a pointer to the buffer in memory, and an unsigned integer containing the size of the buffer. During the download the ``onprogress`` callback is called with progress information. If an error occurs, ``onerror`` will be called with the HTTP status code and a string containing the status description.
 	
 	:param url: The URL of the file to load.
@@ -549,8 +550,8 @@ Functions
 	:param param: Request parameters for POST requests (see ``requesttype``). The parameters are specified in the same way as they would be in the URL for an equivalent GET request: e.g. ``key=value&key2=value2``.
 	:type param: const char*
 	:param void* arg: User-defined data that is passed to the callbacks, untouched by the API itself. This may be used by a callback to identify the associated call.
-	:param const int free: Tells the runtime whether to free the returned buffer after ``onload`` is complete. If ``false`` freeing the buffer is the receiver's responsibility.
-	:type free: const int
+	:param int free: Tells the runtime whether to free the returned buffer after ``onload`` is complete. If ``false`` freeing the buffer is the receiver's responsibility.
+	:type free: int
 	:param em_async_wget2_data_onload_func onload: Callback on successful load of the file. The callback function parameter values are:
 	
 		- *(void*)* : Equal to ``arg`` (user defined data).
@@ -572,26 +573,26 @@ Functions
 	:returns: A handle to request (``int``) that can be used to :c:func:`abort <emscripten_async_wget2_abort>` the request.		
 
 
-.. c:function:: emscripten_async_wget2_abort(int handle)
+.. c:function:: void emscripten_async_wget2_abort(int handle)
 
 	Abort an asynchronous request raised using :c:func:`emscripten_async_wget2` or :c:func:`emscripten_async_wget2_data`.
 	
 	:param int handle: A handle to request to be aborted.
 
 
-.. c:function:: void emscripten_async_prepare_data(char* data, int size, const char *suffix, void *arg, em_async_prepare_data_onload_func onload, em_arg_callback_func onerror)
+.. c:function:: void emscripten_run_preload_plugins_data(char* data, int size, const char *suffix, void *arg, em_run_preload_plugins_data_onload_func onload, em_arg_callback_func onerror)
 		 
-	Prepares a buffer of data asynchronously. This is a "data" version of :c:func:`emscripten_async_prepare`, which receives raw data as input instead of a filename (this can prevent the need to write data to a file first). 
+	Runs preload plugins on a buffer of data asynchronously. This is a "data" version of :c:func:`emscripten_run_preload_plugins`, which receives raw data as input instead of a filename (this can prevent the need to write data to a file first). 
 	
 	When file is loaded then the ``onload`` callback will be called. If any error occurs ``onerror`` will be called.
 	
 	``onload`` also receives a second parameter, which is a 'fake' filename which you can pass into ``IMG_Load`` (it is not an actual file, but it identifies this image for ``IMG_Load`` to be able to process it). Note that the user of this API is responsible for ``free()`` ing the memory allocated for the fake filename.
 
-	:param char* data: The buffer of data to prepare.
+	:param char* data: The buffer of data to process.
 	:param suffix: The file suffix, e.g. 'png' or 'jpg'.
 	:type suffix: const char* 
 	:param void* arg: User-defined data that is passed to the callbacks, untouched by the API itself. This may be used by a callback to identify the associated call.
-	:param em_async_prepare_data_onload_func onload: Callback on successful preparation of the file. The callback function parameter values are:	
+	:param em_run_preload_plugins_data_onload_func onload: Callback on successful processing of the data. The callback function parameter values are:	
 	
 		- *(void*)* : Equal to ``arg`` (user defined data).
 		- *(const char*)* : A 'fake' filename which you can pass into ``IMG_Load``. See above for more information.
@@ -636,7 +637,7 @@ Emscripten Asynchronous IndexedDB API
 	:param ptr: A pointer to the data to store.
 	:param num: How many bytes to store.
 	:param void* arg: User-defined data that is passed to the callbacks, untouched by the API itself. This may be used by a callback to identify the associated call.
-	:param em_async_wget_onload_func onload: Callback on successful load of the URL into the buffer. The callback function parameter values are:	
+	:param em_arg_callback_func onstore: Callback on successful store of the data buffer to the URL. The callback function parameter values are:
 	
 		- *(void*)* : Equal to ``arg`` (user defined data).
 	
@@ -661,7 +662,7 @@ Emscripten Asynchronous IndexedDB API
 	
 		- *(void*)* : Equal to ``arg`` (user defined data).
 
-.. c:function:: void emscripten_idb_async_exists(const char *db_name, const char *file_id, void* arg, em_arg_callback_func oncheck, em_arg_callback_func onerror)
+.. c:function:: void emscripten_idb_async_exists(const char *db_name, const char *file_id, void* arg, em_idb_exists_func oncheck, em_arg_callback_func onerror)
 		 
 	Checks if data with a certain ID exists in the local IndexedDB storage asynchronously.
 	
@@ -670,7 +671,7 @@ Emscripten Asynchronous IndexedDB API
 	:param db_name: The IndexedDB database.
 	:param file_id: The identifier of the data.
 	:param void* arg: User-defined data that is passed to the callbacks, untouched by the API itself. This may be used by a callback to identify the associated call.
-	:param em_arg_callback_func oncheck: Callback on successful check, with arguments
+	:param em_idb_exists_func oncheck: Callback on successful check, with arguments
 
 		- *(void*)* : Equal to ``arg`` (user defined data).
 		- *int* : Whether the file exists or not.
@@ -681,23 +682,21 @@ Emscripten Asynchronous IndexedDB API
 
 
 
-.. c:function:: int emscripten_async_prepare(const char* file, em_str_callback_func onload, em_str_callback_func onerror)
+.. c:function:: int emscripten_run_preload_plugins(const char* file, em_str_callback_func onload, em_str_callback_func onerror)
 		 
-	Prepares a file asynchronously.
+	Runs preload plugins on a file asynchronously. It works on file data already present and performs any required asynchronous operations available as preload plugins, such as decoding images for use in ``IMG_Load``, or decoding audio for use in ``Mix_LoadWAV``. 
 	
-	This does just the preparation part of :c:func:`emscripten_async_wget`. That is, it works on file data already present and performs any required asynchronous operations (for example, decoding images for use in ``IMG_Load``, decoding audio for use in ``Mix_LoadWAV``, etc.). 
-	
-	Once the operations are complete (the file is prepared), the ``onload`` callback will be called. If any error occurs ``onerror`` will be called. The callbacks are called with the file as their argument.
+	Once the operations are complete, the ``onload`` callback will be called. If any error occurs ``onerror`` will be called. The callbacks are called with the file as their argument.
 
-	:param file: The name of the file to prepare.
+	:param file: The name of the file to process.
 	:type file: const char* 
-	:param em_str_callback_func onload: Callback on successful preparation of the file. The callback function parameter value is:
+	:param em_str_callback_func onload: Callback on successful processing of the file. The callback function parameter value is:
 	
-		- *(const char*)* : The name of the ``file`` that was prepared.
+		- *(const char*)* : The name of the ``file`` that was processed.
 		
 	:param em_str_callback_func onerror: Callback in the event of failure. The callback function parameter value is:	
 	
-		- *(const char*)* : The name of the ``file`` for which the prepare failed.
+		- *(const char*)* : The name of the ``file`` for which the operation failed.
 		
 	:return: 0 if successful, -1 if the file does not exist
 	:rtype: int
@@ -930,6 +929,14 @@ Functions
 	:returns: A pointer to the preloaded image or NULL.
 	:rtype: char*
 
+.. c:function:: int emscripten_print_double(double x, char *to, signed max)
+
+	Prints a double as a string, including a null terminator. This is useful because JS engines have good support for printing out a double in a way that takes the least possible size, but preserves all the information in the double, i.e., it can then be parsed back in a perfectly reversible manner (snprintf etc. do not do so, sadly).
+
+	:param double x: The double.
+	:param char* to: A pre-allocated buffer of sufficient size, or NULL if no output is requested (useful to get the necessary size).
+	:param signed max: The maximum number of bytes that can be written to the output pointer 'to' (including the null terminator).
+	:rtype: The number of necessary bytes, not including the null terminator (actually written, if ``to`` is not NULL).
 	
 .. _emscripten-api-reference-sockets:
 
@@ -991,14 +998,14 @@ Callback functions
 Functions
 ---------
 
-.. c:function:: void emscripten_set_socket_error_callback(void *userData, em_socket_error_callback *callback)
+.. c:function:: void emscripten_set_socket_error_callback(void *userData, em_socket_error_callback callback)
 
 	Triggered by a ``WebSocket`` error. 
 	
 	See :ref:`emscripten-api-reference-sockets` for more information.
 	
 	:param void* userData: Arbitrary user data to be passed to the callback.
-	:param em_socket_error_callback* callback: Pointer to a callback function. The callback returns a file descriptor, error code and message, and the arbitrary ``userData`` passed to this function.
+	:param em_socket_error_callback callback: Pointer to a callback function. The callback returns a file descriptor, error code and message, and the arbitrary ``userData`` passed to this function.
 
 
 .. c:function:: void emscripten_set_socket_open_callback(void *userData, em_socket_callback callback)
@@ -1163,21 +1170,21 @@ Typedefs
 Functions
 ---------
 
-.. c::function:: void emscripten_sleep(unsigned int ms)
+.. c:function:: void emscripten_sleep(unsigned int ms)
 
     Sleep for `ms` milliseconds.
 
-.. c::function:: emscripten_coroutine emscripten_coroutine_create(em_arg_callback_func func, void *arg, int stack_size)
+.. c:function:: emscripten_coroutine emscripten_coroutine_create(em_arg_callback_func func, void *arg, int stack_size)
 
     Create a coroutine which will be run as `func(arg)`.
 
     :param int stack_size: the stack size that should be allocated for the coroutine, use 0 for the default value.
 
-.. c::function:: int emscripten_coroutine_next(emscripten_coroutine coroutine)
+.. c:function:: int emscripten_coroutine_next(emscripten_coroutine coroutine)
 
     Run `coroutine` until it returns, or `emscripten_yield` is called. A non-zero value is returned if `emscripten_yield` is called, otherwise 0 is returned, and future calls of `emscripten_coroutine_next` on this coroutine is undefined behaviour.
 
-.. c::function:: void emscripten_yield(void)
+.. c:function:: void emscripten_yield(void)
 
     This function should only be called in a coroutine created by `emscripten_coroutine_create`, when it called, the coroutine is paused and the caller will continue.
     

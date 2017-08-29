@@ -11,10 +11,13 @@ data downloads.
 
 Usage:
 
-  file_packager.py TARGET [--preload A [B..]] [--embed C [D..]] [--exclude E [F..]] [--compress COMPRESSION_DATA] [--crunch[=X]] [--js-output=OUTPUT.js] [--no-force] [--use-preload-cache] [--no-heap-copy] [--separate-metadata]
+  file_packager.py TARGET [--preload A [B..]] [--embed C [D..]] [--exclude E [F..]] [--crunch[=X]] [--js-output=OUTPUT.js] [--no-force] [--use-preload-cache] [--indexedDB-name=EM_PRELOAD_CACHE] [--no-heap-copy] [--separate-metadata] [--lz4] [--use-preload-plugins]
 
   --preload  ,
   --embed    See emcc --help for more details on those options.
+
+  --exclude E [F..] Specifies filename pattern matches to use for excluding given files from being added to the package.
+                    See https://docs.python.org/2/library/fnmatch.html for syntax.
 
   --no-closure In general, the file packager emits closure compiler-compatible code, which requires an eval().
                With this flag passed, we avoid emitting the eval. emcc passes this flag by default whenever
@@ -34,11 +37,19 @@ Usage:
 
   --use-preload-cache Stores package in IndexedDB so that subsequent loads don't need to do XHR. Checks package version.
 
+  --indexedDB-name Use specified IndexedDB database name (Default: 'EM_PRELOAD_CACHE')
+
   --no-heap-copy If specified, the preloaded filesystem is not copied inside the Emscripten HEAP, but kept in a separate typed array outside it.
                  The default, if this is not specified, is to embed the VFS inside the HEAP, so that mmap()ing files in it is a no-op.
                  Passing this flag optimizes for fread() usage, omitting it optimizes for mmap() usage.
 
   --separate-metadata Stores package metadata separately. Only applicable when preloading and js-output file is specified.
+
+  --lz4 Uses LZ4. This compresses the data using LZ4 when this utility is run, then the client decompresses chunks on the fly, avoiding storing
+        the entire decompressed data in memory at once. See LZ4 in src/settings.js, you must build the main program with that flag.
+
+  --use-preload-plugins Tells the file packager to run preload plugins on the files as they are loaded. This performs tasks like decoding images
+                        and audio using the browser's codecs.
 
 Notes:
 
@@ -52,12 +63,14 @@ TODO:        You can also provide .crn files yourself, pre-crunched. With this o
 import os, sys, shutil, random, uuid, ctypes
 import posixpath
 import shared
-from shared import Compression, execute, suffix, unsuffixed
+from shared import execute, suffix, unsuffixed
+from jsrun import run_js
 from subprocess import Popen, PIPE, STDOUT
 import fnmatch
+import json
 
 if len(sys.argv) == 1:
-  print '''Usage: file_packager.py TARGET [--preload A...] [--embed B...] [--exclude C...] [--compress COMPRESSION_DATA] [--no-closure] [--crunch[=X]] [--js-output=OUTPUT.js] [--no-force] [--use-preload-cache] [--no-heap-copy] [--separate-metadata]
+  print '''Usage: file_packager.py TARGET [--preload A...] [--embed B...] [--exclude C...] [--no-closure] [--crunch[=X]] [--js-output=OUTPUT.js] [--no-force] [--use-preload-cache] [--no-heap-copy] [--separate-metadata]
 See the source for more details.'''
   sys.exit(0)
 
@@ -88,12 +101,15 @@ force = True
 # If set to True, IndexedDB (IDBFS in library_idbfs.js) is used to locally cache VFS XHR so that subsequent 
 # page loads can read the data from the offline cache instead.
 use_preload_cache = False
+indexeddb_name = 'EM_PRELOAD_CACHE'
 # If set to True, the blob received from XHR is moved to the Emscripten HEAP, optimizing for mmap() performance.
 # If set to False, the XHR blob is kept intact, and fread()s etc. are performed directly to that data. This optimizes for minimal memory usage and fread() performance.
 no_heap_copy = True
 # If set to True, the package metadata is stored separately from js-output file which makes js-output file immutable to the package content changes.
 # If set to False, the package metadata is stored inside the js-output file which makes js-output file to mutate on each invocation of this packager tool.
 separate_metadata  = False
+lz4 = False
+use_preload_plugins = False
 
 for arg in sys.argv[2:]:
   if arg == '--preload':
@@ -103,21 +119,26 @@ for arg in sys.argv[2:]:
     leading = 'embed'
   elif arg == '--exclude':
     leading = 'exclude'
-  elif arg == '--compress':
-    compress_cnt = 1
-    Compression.on = True
-    leading = 'compress'
   elif arg == '--no-force':
     force = False
     leading = ''
   elif arg == '--use-preload-cache':
     use_preload_cache = True
     leading = ''
+  elif arg.startswith('--indexedDB-name'):
+    indexeddb_name = arg.split('=')[1] if '=' in arg else None
+    leading = ''
   elif arg == '--no-heap-copy':
     no_heap_copy = False
     leading = ''
   elif arg == '--separate-metadata':
     separate_metadata = True
+    leading = ''
+  elif arg == '--lz4':
+    lz4 = True
+    leading = ''
+  elif arg == '--use-preload-plugins':
+    use_preload_plugins = True
     leading = ''
   elif arg.startswith('--js-output'):
     jsoutput = arg.split('=')[1] if '=' in arg else None
@@ -129,7 +150,7 @@ for arg in sys.argv[2:]:
     try:
       from shared import CRUNCH
     except Exception, e:
-      print >> sys.stderr, 'could not import CRUNCH (make sure it is defined properly in ~/.emscripten)'
+      print >> sys.stderr, 'could not import CRUNCH (make sure it is defined properly in ' + shared.hint_config_file_location() + ')'
       raise e
     crunch = arg.split('=')[1] if '=' in arg else '128'
     leading = ''
@@ -151,16 +172,6 @@ for arg in sys.argv[2:]:
       print >> sys.stderr, 'Warning: ' + arg + ' does not exist, ignoring.'
   elif leading == 'exclude':
     excluded_patterns.append(arg)
-  elif leading == 'compress':
-    if compress_cnt == 1:
-      Compression.encoder = arg
-      compress_cnt = 2
-    elif compress_cnt == 2:
-      Compression.decoder = arg
-      compress_cnt = 3
-    elif compress_cnt == 3:
-      Compression.js_name = arg
-      compress_cnt = 0
   else:
     print >> sys.stderr, 'Unknown parameter:', arg
     sys.exit(1)
@@ -168,7 +179,7 @@ for arg in sys.argv[2:]:
 if (not force) and len(data_files) == 0:
   has_preloaded = False
 if not has_preloaded or jsoutput == None:
-  separate_metadata = False
+  assert not separate_metadata, 'cannot separate-metadata without both --preloaded files and a specified --js-output'
 
 ret = '''
 var Module;
@@ -207,7 +218,7 @@ def has_hidden_attribute(filepath):
     attrs = ctypes.windll.kernel32.GetFileAttributesW(unicode(filepath))
     assert attrs != -1
     result = bool(attrs & 2)
-  except (AttributeError, AssertionError):
+  except:
     result = False
   return result
 
@@ -224,7 +235,7 @@ def should_ignore(fullname):
 
 # Returns the given string with escapes added so that it can safely be placed inside a string in JS code.
 def escape_for_js_string(s):
-  s = s.replace("'", "\\'").replace('"', '\\"')
+  s = s.replace('\\', '/').replace("'", "\\'").replace('"', '\\"')
   return s
 
 # Expand directories into individual files
@@ -300,8 +311,7 @@ for file_ in data_files:
   for plugin in plugins:
     plugin(file_)
 
-if separate_metadata:
-  metadata = {'files': []}
+metadata = {'files': []}
 
 # Crunch files
 if crunch:
@@ -392,8 +402,22 @@ if has_preloaded:
   # TODO: sha256sum on data_target
   if start > 256*1024*1024:
     print >> sys.stderr, 'warning: file packager is creating an asset bundle of %d MB. this is very large, and browsers might have trouble loading it. see https://hacks.mozilla.org/2015/02/synchronous-execution-and-filesystem-access-in-emscripten/' % (start/(1024*1024))
-  if Compression.on:
-    Compression.compress(data_target)
+
+  create_preloaded = '''
+        Module['FS_createPreloadedFile'](this.name, null, byteArray, true, true, function() {
+          Module['removeRunDependency']('fp ' + that.name);
+        }, function() {
+          if (that.audio) {
+            Module['removeRunDependency']('fp ' + that.name); // workaround for chromium bug 124926 (still no audio with this, but at least we don't hang)
+          } else {
+            Module.printErr('Preloading file ' + that.name + ' failed');
+          }
+        }, false, true); // canOwn this data in the filesystem, it is a slide into the heap that will never change
+'''
+  create_data = '''
+        Module['FS_createDataFile'](this.name, null, byteArray, true, true, true); // canOwn this data in the filesystem, it is a slide into the heap that will never change
+        Module['removeRunDependency']('fp ' + that.name);
+'''
 
   # Data requests - for getting a block of data out of the big archive - have a similar API to XHRs
   code += '''
@@ -419,17 +443,9 @@ if has_preloaded:
       },
       finish: function(byteArray) {
         var that = this;
-        Module['FS_createPreloadedFile'](this.name, null, byteArray, true, true, function() {
-          Module['removeRunDependency']('fp ' + that.name);
-        }, function() {
-          if (that.audio) {
-            Module['removeRunDependency']('fp ' + that.name); // workaround for chromium bug 124926 (still no audio with this, but at least we don't hang)
-          } else {
-            Module.printErr('Preloading file ' + that.name + ' failed');
-          }
-        }, false, true); // canOwn this data in the filesystem, it is a slide into the heap that will never change
+%s
         this.requests[this.name] = null;
-      },
+      }
     };
 %s
   ''' % ('' if not crunch else '''
@@ -445,12 +461,12 @@ if has_preloaded:
         } else {
 ''', '' if not crunch else '''
         }
-''', '' if not separate_metadata else '''
+''', create_preloaded if use_preload_plugins else create_data, '''
         var files = metadata.files;
         for (i = 0; i < files.length; ++i) {
           new DataRequest(files[i].start, files[i].end, files[i].crunched, files[i].audio).open('GET', files[i].filename);
         }
-''')
+''' if not lz4 else '')
 
 counter = 0
 for file_ in data_files:
@@ -460,7 +476,7 @@ for file_ in data_files:
   if file_['mode'] == 'embed':
     # Embed
     data = map(ord, open(file_['srcpath'], 'rb').read())
-    code += '''fileData%d = [];\n''' % counter
+    code += '''var fileData%d = [];\n''' % counter
     if data:
       parts = []
       chunk_size = 10240
@@ -469,62 +485,63 @@ for file_ in data_files:
         parts.append('''fileData%d.push.apply(fileData%d, %s);\n''' % (counter, counter, str(data[start:start+chunk_size])))
         start += chunk_size
       code += ''.join(parts)
-    code += '''Module['FS_createDataFile']('%s', '%s', fileData%d, true, true);\n''' % (dirname, basename, counter)
+    code += '''Module['FS_createDataFile']('%s', '%s', fileData%d, true, true, false);\n''' % (dirname, basename, counter)
     counter += 1
   elif file_['mode'] == 'preload':
     # Preload
     varname = 'filePreload%d' % counter
     counter += 1
-    if separate_metadata:
-      metadata['files'].append({
-        'filename': escape_for_js_string(file_['dstpath']),
-        'start': file_['data_start'],
-        'end': file_['data_end'],
-        'crunched': '1' if crunch and filename.endswith(CRUNCH_INPUT_SUFFIX) else '0',
-        'audio': '1' if filename[-4:] in AUDIO_SUFFIXES else '0',
-      })
-    else:
-      code += '''    new DataRequest(%(start)d, %(end)d, %(crunched)s, %(audio)s).open('GET', '%(filename)s');
-''' % {
-        'filename': escape_for_js_string(file_['dstpath']),
-        'start': file_['data_start'],
-        'end': file_['data_end'],
-        'crunched': '1' if crunch and filename.endswith(CRUNCH_INPUT_SUFFIX) else '0',
-        'audio': '1' if filename[-4:] in AUDIO_SUFFIXES else '0',
-      }
+    metadata['files'].append({
+      'filename': file_['dstpath'],
+      'start': file_['data_start'],
+      'end': file_['data_end'],
+      'crunched': 1 if crunch and filename.endswith(CRUNCH_INPUT_SUFFIX) else 0,
+      'audio': 1 if filename[-4:] in AUDIO_SUFFIXES else 0,
+    })
   else:
     assert 0
 
 if has_preloaded:
-  # Get the big archive and split it up
-  if no_heap_copy:
-    use_data = '''
-      // copy the entire loaded file into a spot in the heap. Files will refer to slices in that. They cannot be freed though
-      // (we may be allocating before malloc is ready, during startup).
-      var ptr = Module['getMemory'](byteArray.length);
-      Module['HEAPU8'].set(byteArray, ptr);
-      DataRequest.prototype.byteArray = Module['HEAPU8'].subarray(ptr, ptr+byteArray.length);
-'''
-  else:
-    use_data = '''
-      // Reuse the bytearray from the XHR as the source for file reads.
-      DataRequest.prototype.byteArray = byteArray;
-'''
-  for file_ in data_files:
-    if file_['mode'] == 'preload':
-      use_data += '          DataRequest.prototype.requests["%s"].onload();\n' % (escape_for_js_string(file_['dstpath']))
-  use_data += "          Module['removeRunDependency']('datafile_%s');\n" % data_target
+  if not lz4:
+    # Get the big archive and split it up
+    if no_heap_copy:
+      use_data = '''
+        // copy the entire loaded file into a spot in the heap. Files will refer to slices in that. They cannot be freed though
+        // (we may be allocating before malloc is ready, during startup).
+        if (Module['SPLIT_MEMORY']) Module.printErr('warning: you should run the file packager with --no-heap-copy when SPLIT_MEMORY is used, otherwise copying into the heap may fail due to the splitting');
+        var ptr = Module['getMemory'](byteArray.length);
+        Module['HEAPU8'].set(byteArray, ptr);
+        DataRequest.prototype.byteArray = Module['HEAPU8'].subarray(ptr, ptr+byteArray.length);
+  '''
+    else:
+      use_data = '''
+        // Reuse the bytearray from the XHR as the source for file reads.
+        DataRequest.prototype.byteArray = byteArray;
+  '''
+    use_data += '''
+          var files = metadata.files;
+          for (i = 0; i < files.length; ++i) {
+            DataRequest.prototype.requests[files[i].filename].onload();
+          }
+    '''
+    use_data += "          Module['removeRunDependency']('datafile_%s');\n" % escape_for_js_string(data_target)
 
-  if Compression.on:
+  else:
+    # LZ4FS usage
+    temp = data_target + '.orig'
+    shutil.move(data_target, temp)
+    meta = run_js(shared.path_from_root('tools', 'lz4-compress.js'), shared.NODE_JS, [shared.path_from_root('src', 'mini-lz4.js'), temp, data_target], stdout=PIPE)
+    os.unlink(temp)
     use_data = '''
-      Module["decompress"](byteArray, function(decompressed) {
-        byteArray = new Uint8Array(decompressed);
-        %s
-      });
-    ''' % use_data
+          var compressedData = %s;
+          compressedData.data = byteArray;
+          assert(typeof LZ4 === 'object', 'LZ4 not present - was your app build with  -s LZ4=1  ?');
+          LZ4.loadPackage({ 'metadata': metadata, 'compressedData': compressedData });
+          Module['removeRunDependency']('datafile_%s');
+    ''' % (meta, escape_for_js_string(data_target))
 
   package_uuid = uuid.uuid4();
-  package_name = Compression.compressed_name(data_target) if Compression.on else data_target
+  package_name = data_target
   statinfo = os.stat(package_name)
   remote_package_size = statinfo.st_size
   remote_package_name = os.path.basename(package_name)
@@ -547,26 +564,20 @@ if has_preloaded:
     var REMOTE_PACKAGE_NAME = typeof Module['locateFile'] === 'function' ?
                               Module['locateFile'](REMOTE_PACKAGE_BASE) :
                               ((Module['filePackagePrefixURL'] || '') + REMOTE_PACKAGE_BASE);
-  ''' % (data_target, remote_package_name)
-  if separate_metadata:
-    metadata['remote_package_size'] = remote_package_size
-    metadata['package_uuid'] = str(package_uuid)
-    ret += '''
-      var REMOTE_PACKAGE_SIZE = metadata.remote_package_size;
-      var PACKAGE_UUID = metadata.package_uuid;
-    '''
-  else:
-    ret += '''
-      var REMOTE_PACKAGE_SIZE = %d;
-      var PACKAGE_UUID = '%s';
-    ''' % (remote_package_size, package_uuid)
+  ''' % (escape_for_js_string(data_target), escape_for_js_string(remote_package_name))
+  metadata['remote_package_size'] = remote_package_size
+  metadata['package_uuid'] = str(package_uuid)
+  ret += '''
+    var REMOTE_PACKAGE_SIZE = metadata.remote_package_size;
+    var PACKAGE_UUID = metadata.package_uuid;
+  '''
 
   if use_preload_cache:
     code += r'''
       var indexedDB = window.indexedDB || window.mozIndexedDB || window.webkitIndexedDB || window.msIndexedDB;
       var IDB_RO = "readonly";
       var IDB_RW = "readwrite";
-      var DB_NAME = 'EM_PRELOAD_CACHE';
+      var DB_NAME = "''' + indexeddb_name + '''";
       var DB_VERSION = 1;
       var METADATA_STORE_NAME = 'METADATA';
       var PACKAGE_STORE_NAME = 'PACKAGES';
@@ -603,7 +614,7 @@ if has_preloaded:
         var transaction = db.transaction([METADATA_STORE_NAME], IDB_RO);
         var metadata = transaction.objectStore(METADATA_STORE_NAME);
 
-        var getRequest = metadata.get(packageName);
+        var getRequest = metadata.get("metadata/" + packageName);
         getRequest.onsuccess = function(event) {
           var result = event.target.result;
           if (!result) {
@@ -621,7 +632,7 @@ if has_preloaded:
         var transaction = db.transaction([PACKAGE_STORE_NAME], IDB_RO);
         var packages = transaction.objectStore(PACKAGE_STORE_NAME);
 
-        var getRequest = packages.get(packageName);
+        var getRequest = packages.get("package/" + packageName);
         getRequest.onsuccess = function(event) {
           var result = event.target.result;
           callback(result);
@@ -632,13 +643,14 @@ if has_preloaded:
       };
 
       function cacheRemotePackage(db, packageName, packageData, packageMeta, callback, errback) {
-        var transaction = db.transaction([PACKAGE_STORE_NAME, METADATA_STORE_NAME], IDB_RW);
-        var packages = transaction.objectStore(PACKAGE_STORE_NAME);
-        var metadata = transaction.objectStore(METADATA_STORE_NAME);
+        var transaction_packages = db.transaction([PACKAGE_STORE_NAME], IDB_RW);
+        var packages = transaction_packages.objectStore(PACKAGE_STORE_NAME);
 
-        var putPackageRequest = packages.put(packageData, packageName);
+        var putPackageRequest = packages.put(packageData, "package/" + packageName);
         putPackageRequest.onsuccess = function(event) {
-          var putMetadataRequest = metadata.put(packageMeta, packageName);
+          var transaction_metadata = db.transaction([METADATA_STORE_NAME], IDB_RW);
+          var metadata = transaction_metadata.objectStore(METADATA_STORE_NAME);
+          var putMetadataRequest = metadata.put(packageMeta, "metadata/" + packageName);
           putMetadataRequest.onsuccess = function(event) {
             callback(packageData);
           };
@@ -687,9 +699,16 @@ if has_preloaded:
           if (Module['setStatus']) Module['setStatus']('Downloading data...');
         }
       };
+      xhr.onerror = function(event) {
+        throw new Error("NetworkError for: " + packageName);
+      }
       xhr.onload = function(event) {
-        var packageData = xhr.response;
-        callback(packageData);
+        if (xhr.status == 200 || xhr.status == 304 || xhr.status == 206 || (xhr.status == 0 && xhr.response)) { // file URLs can return 0
+          var packageData = xhr.response;
+          callback(packageData);
+        } else {
+          throw new Error(xhr.statusText + " : " + xhr.responseURL);
+        }
       };
       xhr.send(null);
     };
@@ -703,12 +722,13 @@ if has_preloaded:
     function processPackageData(arrayBuffer) {
       Module.finishedDataFileDownloads++;
       assert(arrayBuffer, 'Loading data file failed.');
+      assert(arrayBuffer instanceof ArrayBuffer, 'bad input to processPackageData');
       var byteArray = new Uint8Array(arrayBuffer);
       var curr;
       %s
     };
     Module['addRunDependency']('datafile_%s');
-  ''' % (use_data, data_target) # use basename because from the browser's point of view, we need to find the datafile in the same dir as the html file
+  ''' % (use_data, escape_for_js_string(data_target)) # use basename because from the browser's point of view, we need to find the datafile in the same dir as the html file
 
   code += r'''
     if (!Module.preloadResults) Module.preloadResults = {};
@@ -821,8 +841,8 @@ ret += '''%s
  });
 ''' % {'metadata_file': os.path.basename(jsoutput + '.metadata')} if separate_metadata else '''
  }
- loadPackage();
-''')
+ loadPackage(%s);
+''' % json.dumps(metadata))
 
 if force or len(data_files) > 0:
   if jsoutput == None:
@@ -841,7 +861,6 @@ if force or len(data_files) > 0:
       f.write(ret)
     f.close()
     if separate_metadata:
-      import json
       f = open(jsoutput + '.metadata', 'w')
       json.dump(metadata, f, separators=(',', ':'))
       f.close()

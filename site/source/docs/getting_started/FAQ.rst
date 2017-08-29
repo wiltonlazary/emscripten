@@ -62,6 +62,12 @@ The main tips for improving build time are:
 
 - Make sure that the native optimizer is being used, which greatly speeds up optimized builds as of 1.28.2. ``EMCC_DEBUG=1`` output should not report errors about the native optimizer failing to build or not being used because of a previous failed build (if it previously failed, do ``emcc --clear-cache`` then compile your file again, and the optimizer will be automatically rebuilt).
 
+- When you have multiple bitcode files as inputs, put the largest file first (LLVM linking links the second and later ones into the first, so less copying is done on the first input to the linker).
+
+- Having fewer bitcode files can be faster, so you might want to link files into larger files in parallel in your build system (you might already do this if you have logical libraries), and then the final command has fewer things to operate on.
+
+- You don't need to link into a single bitcode file yourself, you can call the final ``emcc`` command that emits JS with a list of files. ``emcc`` can then defer linking and avoid an intermediary step, if possible (this optimization is disabled by LTO and by `EMCC_DEBUG=2`).
+
 	
 Why does my code run slowly?
 ============================
@@ -178,7 +184,7 @@ Why can't my code access a file in the same directory?
 
 Emscripten-generated code running *in the browser* cannot access files in the local file system. Instead you can use :ref:`preloading <emcc-preload-file>` and :ref:`embedding <emcc-embed-file>` to work around the lack of synchronous file IO. See :ref:`file-system-overview` for more information.
 
-It is possible to allow access to local file system for code running in *node.js*.
+It is possible to allow access to local file system for code running in *node.js*, use the :ref:`NODEFS <filesystem-api-nodefs>` filesystem option.
 
 
 .. _faq-when-safe-to-call-compiled-functions:
@@ -186,9 +192,9 @@ It is possible to allow access to local file system for code running in *node.js
 How can I tell when the page is fully loaded and it is safe to call compiled functions?
 =======================================================================================
 
-(You may need this answer if you see an error saying something like ``you need to wait for the runtime to be ready (e.g. wait for main() to be called)``.)
+(You may need this answer if you see an error saying something like ``you need to wait for the runtime to be ready (e.g. wait for main() to be called)``, which is a check enabled in ``ASSERTIONS`` builds.)
 
-Calling a compiled function before a page has fully loaded can result in an error, if the function relies on files that may not be present (for example the :ref:`.mem <emcc-memory-init-file>` file and :ref:`preloaded <emcc-preload-file>` files are loaded asynchronously).
+Calling a compiled function before a page has fully loaded can result in an error, if the function relies on files that may not be present (for example the :ref:`.mem <emcc-memory-init-file>` file and :ref:`preloaded <emcc-preload-file>` files are loaded asynchronously, and therefore if you just place some JS that calls compiled code in a ``--post-js``, that code will be called synchronously at the end of the combined JS file, potentially before the asynchronous event happens, which is bad).
 
 The easiest way to find out when loading is complete is to add a ``main()`` function, and within it call a JavaScript function to notify your code that loading is complete. 
 
@@ -253,9 +259,20 @@ To make sure a C function remains available to be called from normal JavaScript,
 
 	./emcc -s EXPORTED_FUNCTIONS="['_main', '_my_func']"  ...
 
+.. note:: 
+
+   `_main` should be in the export list, as in that example, if you have a `main()` function. Otherwise, it will be removed as dead code; there is no special logic to keep `main()` alive by default.
+
+.. note:: 
+
+   `EXPORTED_FUNCTIONS` affects compilation to JavaScript. If you first compile to an object file,
+   then compile the object to JavaScript, you need that option on the second command.
+
 If your function is used in other functions, LLVM may inline it and it will not appear as a unique function in the JavaScript. Prevent inlining by defining the function with :c:type:`EMSCRIPTEN_KEEPALIVE`: ::
 
 	void EMSCRIPTEN_KEEPALIVE yourCfunc() {..}
+
+`EMSCRIPTEN_KEEPALIVE` also exports the function, as if it were on `EXPORTED_FUNCTIONS`.
 	
 .. note:: 
 
@@ -354,6 +371,19 @@ Why do I get odd rounding errors when using float variables?
 By default Emscripten uses doubles for all floating-point variables, that is, 64-bit floats even when C/C++ code contains 32-bit floats. This is simplest and most efficient to implement in JS as doubles are the only native numeric type. As a result, you may see rounding errors compared to native code using 32-bit floats, just because of the difference in precision between 32-bit and 64-bit floating-point values.
 
 To check if this is the issue you are seeing, build with ``-s PRECISE_F32=1``. This uses proper 32-bit floating-point values, at the cost of some extra code size overhead. This may be faster in some browsers, if they optimize ``Math.fround``, but can be slower in others. See ``src/settings.js`` for more details on this option.
+
+Can I use multiple Emscripten-compiled programs on one Web page?
+================================================================
+
+Emscripten output by default is just some code. When put in a script tag, that means the code is in the global scope. So multiple such modules on the same page can't work.
+
+But by putting each module in a function scope, that problem is avoided. Emscripten even has a compile flag for this, ``MODULARIZE``, useful in conjunction with ``EXPORT_NAME`` (details in settings.js).
+
+However, there are still some issues if the same Module object (that defines the canvas, text output area, etc.) is used among separate modules. By default Emscripten output even looks for Module in the global scope, but when using MODULARIZE, you get a function you must call with the Module as a param, so that problem is avoided. But note that each module will probably want its own canvas, text output area, etc.; just passing in the same Module object (e.g. from the default HTML shell) may not work.
+
+So by using MODULARIZE and creating a proper Module object for each module, and passing those in, multiple modules can work fine.
+
+Another option is to use an iframe, in which case the default HTML shell will just work, as each will have its own canvas, etc. But this is overkill for small programs, which can run modularly as described above.
 
 		
 Why the weird name for the project?

@@ -1,477 +1,209 @@
 # coding=utf-8
 
-import glob, hashlib, os, re, shutil, subprocess, sys
+import glob, hashlib, os, re, shutil, subprocess, sys, json, random
 from textwrap import dedent
 import tools.shared
 from tools.shared import *
 from tools.line_endings import check_line_endings
 from runner import RunnerCore, path_from_root, checked_sanity, test_modes, get_zlib_library, get_bullet_library
 
+# decorators for limiting which modes a test can run in
+
+def SIMD(f):
+  def decorated(self):
+    if self.is_emterpreter(): return self.skip('simd not supported in emterpreter yet')
+    if self.is_wasm(): return self.skip('wasm will not support SIMD in the MVP')
+    self.use_all_engines = True # checks both native in spidermonkey and polyfill in others
+    f(self)
+  return decorated
+
+# Generic decorator that calls a function named 'condition' on the test class and
+# skips the test if that function returns true
+def skip_if(func, condition, explanation=''):
+  explanation_str = ' : %s' % explanation if explanation else ''
+  def decorated(self):
+    if self.__getattribute__(condition)():
+      return self.skip(condition + explanation_str)
+    return func(self)
+  return decorated
+
+def no_emterpreter(f):
+  return skip_if(f, 'is_emterpreter')
+
+def no_wasm(f):
+  return skip_if(f, 'is_wasm')
+
+def no_wasm_backend(note=''):
+  def decorated(f):
+    return skip_if(f, 'is_wasm_backend', note)
+  return decorated
+
+
 class T(RunnerCore): # Short name, to make it more fun to use manually on the commandline
   def is_emterpreter(self):
     return 'EMTERPRETIFY=1' in self.emcc_args
+  def is_split_memory(self):
+    return 'SPLIT_MEMORY=' in str(self.emcc_args)
+  def is_wasm(self):
+    return 'BINARYEN' in str(self.emcc_args) or self.is_wasm_backend()
+
+  def do_run_in_out_file_test(self, *path, **kwargs):
+      test_path = path_from_root(*path)
+
+      def find_extension(*ext_list):
+        ret = None
+        count = 0
+        for ext in ext_list:
+          if os.path.isfile(test_path + ext):
+            ret = ext
+            count += 1
+        if count == 0:
+          assert False, ("No file found at {} with extension {}"
+                         .format(test_path, ext_list))
+        if count > 1:
+          assert False, ("Test file {} found with multiple valid extensions {}"
+                         .format(test_path, ext_list))
+        return ret
+
+      input_extensions = find_extension('.c', '.cpp', '.cc')
+      output_extensions = find_extension('.out', '.txt')
+      extensions = (input_extensions, output_extensions)
+
+      src, output = (test_path + ext for ext in extensions)
+      self.do_run_from_file(src, output, **kwargs)
 
   def test_hello_world(self):
-      test_path = path_from_root('tests', 'core', 'test_hello_world')
-      src, output = (test_path + s for s in ('.in', '.out'))
-
-      self.do_run_from_file(src, output)
+      self.do_run_in_out_file_test('tests', 'core', 'test_hello_world')
 
       src = open(self.in_dir('src.cpp.o.js')).read()
       assert 'EMSCRIPTEN_GENERATED_FUNCTIONS' not in src, 'must not emit this unneeded internal thing'
 
   def test_intvars(self):
-      test_path = path_from_root('tests', 'core', 'test_intvars')
-      src, output = (test_path + s for s in ('.in', '.out'))
-
-      self.do_run_from_file(src, output)
+      self.do_run_in_out_file_test('tests', 'core', 'test_intvars')
 
   def test_sintvars(self):
-      test_path = path_from_root('tests', 'core', 'test_sintvars')
-      src, output = (test_path + s for s in ('.in', '.out'))
-
-      self.do_run_from_file(src, output, force_c=True)
+      self.do_run_in_out_file_test('tests', 'core', 'test_sintvars',
+                                   force_c=True)
 
   def test_i64(self):
-      src = '''
-        #include <stdio.h>
-        int main()
-        {
-          long long a = 0x2b00505c10;
-          long long b = a >> 29;
-          long long c = a >> 32;
-          long long d = a >> 34;
-          printf("*%Ld,%Ld,%Ld,%Ld*\\n", a, b, c, d);
-          unsigned long long ua = 0x2b00505c10;
-          unsigned long long ub = ua >> 29;
-          unsigned long long uc = ua >> 32;
-          unsigned long long ud = ua >> 34;
-          printf("*%Ld,%Ld,%Ld,%Ld*\\n", ua, ub, uc, ud);
+      self.do_run_in_out_file_test('tests', 'core', 'test_i64')
 
-          long long x = 0x0000def123450789ULL; // any bigger than this, and we
-          long long y = 0x00020ef123456089ULL; // start to run into the double precision limit!
-          printf("*%Ld,%Ld,%Ld,%Ld,%Ld*\\n", x, y, x | y, x & y, x ^ y, x >> 2, y << 2);
+  def test_i64_2(self):
+      self.do_run_in_out_file_test('tests', 'core', 'test_i64_2')
 
-          printf("*");
-          long long z = 13;
-          int n = 0;
-          while (z > 1) {
-            printf("%.2f,", (float)z); // these must be integers!
-            z = z >> 1;
-            n++;
-          }
-          printf("*%d*\\n", n);
-          return 0;
-        }
-      '''
-      self.do_run(src, '*184688860176,344,43,10*\n*184688860176,344,43,10*\n*245127260211081,579378795077769,808077213656969,16428841631881,791648372025088*\n*13.00,6.00,3.00,*3*')
+  def test_i64_3(self):
+      self.do_run_in_out_file_test('tests', 'core', 'test_i64_3')
 
-      src = r'''
-        #include <time.h>
-        #include <stdio.h>
-        #include <stdint.h>
-
-        int64_t returner1() { return 0x0000def123450789ULL; }
-        int64_t returner2(int test) {
-          while (test > 10) test /= 2; // confuse the compiler so it doesn't eliminate this function
-          return test > 5 ? 0x0000def123450123ULL : 0ULL;
-        }
-
-        void modifier1(int64_t t) {
-          t |= 12;
-          printf("m1: %Ld\n", t);
-        }
-        void modifier2(int64_t &t) {
-          t |= 12;
-        }
-
-        int truthy() {
-          int x = time(0);
-          while (x > 10) {
-            x |= 7;
-            x /= 2;
-          }
-          return x < 3;
-        }
-
-        struct IUB {
-           int c;
-           long long d;
-        };
-
-        IUB iub[] = {
-           { 55, 17179869201 },
-           { 122, 25769803837 },
-        };
-
-        int main(int argc, char **argv)
-        {
-          int64_t x1 = 0x1234def123450789ULL;
-          int64_t x2 = 0x1234def123450788ULL;
-          int64_t x3 = 0x1234def123450789ULL;
-          printf("*%Ld\n%d,%d,%d,%d,%d\n%d,%d,%d,%d,%d*\n", x1, x1==x2, x1<x2, x1<=x2, x1>x2, x1>=x2, // note: some rounding in the printing!
-                                                                x1==x3, x1<x3, x1<=x3, x1>x3, x1>=x3);
-          printf("*%Ld*\n", returner1());
-          printf("*%Ld*\n", returner2(30));
-
-          uint64_t maxx = -1ULL;
-          printf("*%Lu*\n*%Lu*\n", maxx, maxx >> 5);
-
-          // Make sure params are not modified if they shouldn't be
-          int64_t t = 123;
-          modifier1(t);
-          printf("*%Ld*\n", t);
-          modifier2(t);
-          printf("*%Ld*\n", t);
-
-          // global structs with i64s
-          printf("*%d,%Ld*\n*%d,%Ld*\n", iub[0].c, iub[0].d, iub[1].c, iub[1].d);
-
-          // Bitshifts
-          {
-            int64_t a = -1;
-            int64_t b = a >> 29;
-            int64_t c = a >> 32;
-            int64_t d = a >> 34;
-            printf("*%Ld,%Ld,%Ld,%Ld*\n", a, b, c, d);
-            uint64_t ua = -1;
-            int64_t ub = ua >> 29;
-            int64_t uc = ua >> 32;
-            int64_t ud = ua >> 34;
-            printf("*%Ld,%Ld,%Ld,%Ld*\n", ua, ub, uc, ud);
-          }
-
-          // Nonconstant bitshifts
-          {
-            int64_t a = -1;
-            int64_t b = a >> (29 - argc + 1);
-            int64_t c = a >> (32 - argc + 1);
-            int64_t d = a >> (34 - argc + 1);
-            printf("*%Ld,%Ld,%Ld,%Ld*\n", a, b, c, d);
-            uint64_t ua = -1;
-            int64_t ub = ua >> (29 - argc + 1);
-            int64_t uc = ua >> (32 - argc + 1);
-            int64_t ud = ua >> (34 - argc + 1);
-            printf("*%Ld,%Ld,%Ld,%Ld*\n", ua, ub, uc, ud);
-          }
-
-          // Math mixtures with doubles
-          {
-            uint64_t a = 5;
-            double b = 6.8;
-            uint64_t c = a * b;
-            if (truthy()) printf("*%d,%d,%d*\n", (int)&a, (int)&b, (int)&c); // printing addresses prevents optimizations
-            printf("*prod:%llu*\n", c);
-          }
-
-          // Basic (rounded, for now) math. Just check compilation.
-          int64_t a = 0x1234def123450789ULL;
-          a--; if (truthy()) a--; // confuse optimizer
-          int64_t b = 0x1234000000450789ULL;
-          b++; if (truthy()) b--; // confuse optimizer
-          printf("*%Ld,%Ld,%Ld,%Ld*\n",   (a+b)/5000, (a-b)/5000, (a*3)/5000, (a/5)/5000);
-
-          a -= 17; if (truthy()) a += 5; // confuse optimizer
-          b -= 17; if (truthy()) b += 121; // confuse optimizer
-          printf("*%Lx,%Lx,%Lx,%Lx*\n", b - a, b - a/2, b/2 - a, b - 20);
-
-          if (truthy()) a += 5/b; // confuse optimizer
-          if (truthy()) b += 121*(3+a/b); // confuse optimizer
-          printf("*%Lx,%Lx,%Lx,%Lx*\n", a - b, a - b/2, a/2 - b, a - 20);
-
-          return 0;
-        }
-      '''
-      self.do_run(src, '*1311918518731868041\n' +
-                       '0,0,0,1,1\n' +
-                       '1,0,1,0,1*\n' +
-                       '*245127260211081*\n' +
-                       '*245127260209443*\n' +
-                       '*18446744073709551615*\n' +
-                       '*576460752303423487*\n' +
-                       'm1: 127\n' +
-                       '*123*\n' +
-                       '*127*\n' +
-                       '*55,17179869201*\n' +
-                       '*122,25769803837*\n' +
-                       '*-1,-1,-1,-1*\n' +
-                       '*-1,34359738367,4294967295,1073741823*\n' +
-                       '*-1,-1,-1,-1*\n' +
-                       '*-1,34359738367,4294967295,1073741823*\n' +
-                       '*prod:34*\n' +
-                       '*524718382041609,49025451137,787151111239120,52476740749274*\n' +
-                       '*ffff210edd000002,91990876ea283be,f6e5210edcdd7c45,1234000000450765*\n' +
-                       '*def122fffffe,91adef1232283bb,f6e66f78915d7c42,1234def123450763*\n')
-
-      src = r'''
-        #include <stdio.h>
-        #include <limits>
-
-        int main()
-        {
-            long long i,j,k;
-
-            i = 0;
-            j = -1,
-            k = 1;
-
-            printf( "*\n" );
-            printf( "%s\n", i > j ? "Ok": "Fail" );
-            printf( "%s\n", k > i ? "Ok": "Fail" );
-            printf( "%s\n", k > j ? "Ok": "Fail" );
-            printf( "%s\n", i < j ? "Fail": "Ok" );
-            printf( "%s\n", k < i ? "Fail": "Ok" );
-            printf( "%s\n", k < j ? "Fail": "Ok" );
-            printf( "%s\n", (i-j) >= k ? "Ok": "Fail" );
-            printf( "%s\n", (i-j) <= k ? "Ok": "Fail" );
-            printf( "%s\n", i > std::numeric_limits<long long>::min() ? "Ok": "Fail" );
-            printf( "%s\n", i < std::numeric_limits<long long>::max() ? "Ok": "Fail" );
-            printf( "*\n" );
-        }
-      '''
-
-      self.do_run(src, '*\nOk\nOk\nOk\nOk\nOk\nOk\nOk\nOk\nOk\nOk\n*')
-
+  def test_i64_4(self):
       # stuff that also needs sign corrections
 
-      src = r'''
-        #include <stdio.h>
-        #include <stdint.h>
-
-        int main()
-        {
-          // i32 vs i64
-          int32_t small = -1;
-          int64_t large = -1;
-          printf("*%d*\n", small == large);
-          small++;
-          printf("*%d*\n", small == large);
-          uint32_t usmall = -1;
-          uint64_t ularge = -1;
-          printf("*%d*\n", usmall == ularge);
-          return 0;
-        }
-      '''
-
-      self.do_run(src, '*1*\n*0*\n*0*\n')
+      self.do_run_in_out_file_test('tests', 'core', 'test_i64_4')
 
   def test_i64_b(self):
-      test_path = path_from_root('tests', 'core', 'test_i64_b')
-      src, output = (test_path + s for s in ('.in', '.out'))
-
-      self.do_run_from_file(src, output)
+      self.do_run_in_out_file_test('tests', 'core', 'test_i64_b')
 
   def test_i64_cmp(self):
-      test_path = path_from_root('tests', 'core', 'test_i64_cmp')
-      src, output = (test_path + s for s in ('.in', '.out'))
-
-      self.do_run_from_file(src, output)
+      self.do_run_in_out_file_test('tests', 'core', 'test_i64_cmp')
 
   def test_i64_cmp2(self):
-      test_path = path_from_root('tests', 'core', 'test_i64_cmp2')
-      src, output = (test_path + s for s in ('.in', '.out'))
-
-      self.do_run_from_file(src, output)
+      self.do_run_in_out_file_test('tests', 'core', 'test_i64_cmp2')
 
   def test_i64_double(self):
-      test_path = path_from_root('tests', 'core', 'test_i64_double')
-      src, output = (test_path + s for s in ('.in', '.out'))
-
-      self.do_run_from_file(src, output)
+      self.do_run_in_out_file_test('tests', 'core', 'test_i64_double')
 
   def test_i64_umul(self):
-      test_path = path_from_root('tests', 'core', 'test_i64_umul')
-      src, output = (test_path + s for s in ('.in', '.out'))
-
-      self.do_run_from_file(src, output)
+      self.do_run_in_out_file_test('tests', 'core', 'test_i64_umul')
 
   def test_i64_precise(self):
-      src = r'''
-        #include <inttypes.h>
-        #include <stdio.h>
+      self.do_run_in_out_file_test('tests', 'core', 'test_i64_precise')
 
-        int main() {
-          uint64_t x = 0, y = 0;
-          for (int i = 0; i < 64; i++) {
-            x += 1ULL << i;
-            y += x;
-            x /= 3;
-            y *= 5;
-            printf("unsigned %d: %llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu\n", i, x, y, x+y, x-y, x*y, y ? x/y : 0, x ? y/x : 0, y ? x%y : 0, x ? y%x : 0);
-          }
-          int64_t x2 = 0, y2 = 0;
-          for (int i = 0; i < 64; i++) {
-            x2 += 1LL << i;
-            y2 += x2;
-            x2 /= 3 * (i % 7 ? -1 : 1);
-            y2 *= 5 * (i % 2 ? -1 : 1);
-            printf("signed %d: %lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld\n", i, x2, y2, x2+y2, x2-y2, x2*y2, y2 ? x2/y2 : 0, x2 ? y2/x2 : 0, y2 ? x2%y2 : 0, x2 ? y2%x2 : 0);
-          }
-          return 0;
-        }
-      '''
-      self.do_run(src, open(path_from_root('tests', 'i64_precise.txt')).read())
-
+  def test_i64_precise_unneeded(self):
       # Verify that even if we ask for precision, if it is not needed it is not included
       Settings.PRECISE_I64_MATH = 1
-      src = '''
-        #include <inttypes.h>
-        #include <stdio.h>
-
-        int main(int argc, char **argv) {
-          uint64_t x = 2125299906845564, y = 1225891506842664;
-          if (argc == 12) {
-            x = x >> 1;
-            y = y >> 1;
-          }
-          x = x & 12ULL;
-          y = y | 12ULL;
-          x = x ^ y;
-          x <<= 2;
-          y >>= 3;
-          printf("*%llu, %llu*\\n", x, y);
-        }
-      '''
-      self.do_run(src, '*4903566027370624, 153236438355333*')
+      self.do_run_in_out_file_test('tests', 'core', 'test_i64_precise_unneeded')
 
       code = open(os.path.join(self.get_dir(), 'src.cpp.o.js')).read()
-      assert 'goog.math.Long' not in code, 'i64 precise math should not have been included if not actually used'
+      assert 'goog.math.Long' not in code, 'i64 precise math should never be included, musl does its own printfing'
 
-      # But if we force it to be included, it is. First, a case where we don't need it
-      Settings.PRECISE_I64_MATH = 2
-      self.do_run(open(path_from_root('tests', 'hello_world.c')).read(), 'hello')
-      code = open(os.path.join(self.get_dir(), 'src.cpp.o.js')).read()
-      assert 'goog.math.Long' in code, 'i64 precise math should be included if forced'
-
+  def test_i64_precise_needed(self):
       # and now one where we do
-      self.do_run(r'''
-        #include <stdio.h>
-
-        int main( int argc, char ** argv )
-        {
-            unsigned long a = 0x60DD1695U;
-            unsigned long b = 0xCA8C4E7BU;
-            unsigned long long c = (unsigned long long)a * b;
-            printf( "c = %016llx\n", c );
-
-            return 0;
-        }
-      ''', 'c = 4ca38a6bd2973f97')
+      Settings.PRECISE_I64_MATH = 1
+      self.do_run_in_out_file_test('tests', 'core', 'test_i64_precise_needed')
 
   def test_i64_llabs(self):
     Settings.PRECISE_I64_MATH = 2
 
-    test_path = path_from_root('tests', 'core', 'test_i64_llabs')
-    src, output = (test_path + s for s in ('.in', '.out'))
-
-    self.do_run_from_file(src, output)
+    self.do_run_in_out_file_test('tests', 'core', 'test_i64_llabs')
 
   def test_i64_zextneg(self):
-    test_path = path_from_root('tests', 'core', 'test_i64_zextneg')
-    src, output = (test_path + s for s in ('.in', '.out'))
-
-    self.do_run_from_file(src, output)
+    self.do_run_in_out_file_test('tests', 'core', 'test_i64_zextneg')
 
   def test_i64_7z(self):
-    test_path = path_from_root('tests', 'core', 'test_i64_7z')
-    src, output = (test_path + s for s in ('.in', '.out'))
-
-    self.do_run_from_file(src, output, ['hallo'])
+    self.do_run_in_out_file_test('tests', 'core', 'test_i64_7z',
+                                 args=['hallo'])
 
   def test_i64_i16(self):
-    test_path = path_from_root('tests', 'core', 'test_i64_i16')
-    src, output = (test_path + s for s in ('.in', '.out'))
-
-    self.do_run_from_file(src, output)
+    self.do_run_in_out_file_test('tests', 'core', 'test_i64_i16')
 
   def test_i64_qdouble(self):
-    test_path = path_from_root('tests', 'core', 'test_i64_qdouble')
-    src, output = (test_path + s for s in ('.in', '.out'))
-
-    self.do_run_from_file(src, output)
+    self.do_run_in_out_file_test('tests', 'core', 'test_i64_qdouble')
 
   def test_i64_varargs(self):
-    test_path = path_from_root('tests', 'core', 'test_i64_varargs')
-    src, output = (test_path + s for s in ('.in', '.out'))
+    self.do_run_in_out_file_test('tests', 'core', 'test_i64_varargs',
+                                 args='waka fleefl asdfasdfasdfasdf'
+                                      .split(' '))
 
-    self.do_run_from_file(src, output, 'waka fleefl asdfasdfasdfasdf'.split(' '))
+  def test_vararg_copy(self):
+    self.do_run_in_out_file_test('tests', 'va_arg', 'test_va_copy')
 
   def test_llvm_fabs(self):
     Settings.PRECISE_F32 = 1
-    test_path = path_from_root('tests', 'core', 'test_llvm_fabs')
-    src, output = (test_path + s for s in ('.c', '.out'))
-    self.do_run_from_file(src, output)
+    self.do_run_in_out_file_test('tests', 'core', 'test_llvm_fabs')
 
   def test_double_varargs(self):
-    test_path = path_from_root('tests', 'core', 'test_double_varargs')
-    src, output = (test_path + s for s in ('.c', '.out'))
-    self.do_run_from_file(src, output)
+    self.do_run_in_out_file_test('tests', 'core', 'test_double_varargs')
 
   def test_struct_varargs(self):
-    test_path = path_from_root('tests', 'core', 'test_struct_varargs')
-    src, output = (test_path + s for s in ('.c', '.out'))
-    self.do_run_from_file(src, output)
+    self.do_run_in_out_file_test('tests', 'core', 'test_struct_varargs')
 
   def zzztest_nested_struct_varargs(self):
-    test_path = path_from_root('tests', 'core', 'test_nested_struct_varargs')
-    src, output = (test_path + s for s in ('.c', '.out'))
-    self.do_run_from_file(src, output)
+    self.do_run_in_out_file_test('tests', 'core', 'test_nested_struct_varargs')
 
   def test_i32_mul_precise(self):
-    test_path = path_from_root('tests', 'core', 'test_i32_mul_precise')
-    src, output = (test_path + s for s in ('.in', '.out'))
-
-    self.do_run_from_file(src, output)
+    self.do_run_in_out_file_test('tests', 'core', 'test_i32_mul_precise')
 
   def test_i16_emcc_intrinsic(self):
-    test_path = path_from_root('tests', 'core', 'test_i16_emcc_intrinsic')
-    src, output = (test_path + s for s in ('.in', '.out'))
-
-    self.do_run_from_file(src, output)
+    self.do_run_in_out_file_test('tests', 'core', 'test_i16_emcc_intrinsic')
 
   def test_double_i64_conversion(self):
-    test_path = path_from_root('tests', 'core', 'test_double_i64_conversion')
-    src, output = (test_path + s for s in ('.in', '.out'))
-
-    self.do_run_from_file(src, output)
+    self.do_run_in_out_file_test('tests', 'core', 'test_double_i64_conversion')
 
   def test_float32_precise(self):
     Settings.PRECISE_F32 = 1
-    test_path = path_from_root('tests', 'core', 'test_float32_precise')
-    src, output = (test_path + s for s in ('.in', '.out'))
-
-    self.do_run_from_file(src, output)
+    self.do_run_in_out_file_test('tests', 'core', 'test_float32_precise')
 
   def test_negative_zero(self):
-    test_path = path_from_root('tests', 'core', 'test_negative_zero')
-    src, output = (test_path + s for s in ('.in', '.out'))
-
-    self.do_run_from_file(src, output)
+    self.do_run_in_out_file_test('tests', 'core', 'test_negative_zero')
 
   def test_line_endings(self):
     self.build(open(path_from_root('tests', 'hello_world.cpp')).read(), self.get_dir(), self.in_dir('hello_world.cpp'))
 
   def test_literal_negative_zero(self):
-    test_path = path_from_root('tests', 'core', 'test_literal_negative_zero')
-    src, output = (test_path + s for s in ('.in', '.out'))
+    self.do_run_in_out_file_test('tests', 'core', 'test_literal_negative_zero')
 
-    self.do_run_from_file(src, output)
-
+  @no_wasm_backend('todo')
   def test_llvm_intrinsics(self):
     Settings.PRECISE_I64_MATH = 2 # for bswap64
 
-    test_path = path_from_root('tests', 'core', 'test_llvm_intrinsics')
-    src, output = (test_path + s for s in ('.in', '.out'))
-
-    self.do_run_from_file(src, output)
+    self.do_run_in_out_file_test('tests', 'core', 'test_llvm_intrinsics')
 
   def test_bswap64(self):
     test_path = path_from_root('tests', 'core', 'test_bswap64')
-    src, output = (test_path + s for s in ('.in', '.out'))
+    src, output = (test_path + s for s in ('.c', '.out'))
 
     # extra coverages
     for emulate_casts in [0, 1]:
-      for emulate_fps in [0, 1]:
+      for emulate_fps in [0, 1, 2]:
         print emulate_casts, emulate_fps
         Settings.EMULATE_FUNCTION_POINTER_CASTS = emulate_casts
         Settings.EMULATED_FUNCTION_POINTERS = emulate_fps
@@ -480,40 +212,32 @@ class T(RunnerCore): # Short name, to make it more fun to use manually on the co
   def test_sha1(self):
     self.do_run(open(path_from_root('tests', 'sha1.c')).read(), 'SHA1=15dd99a1991e0b3826fede3deffc1feba42278e6')
 
+  @no_wasm_backend('test checks that __asmjs__ is #defined')
   def test_asmjs_unknown_emscripten(self):
     # No other configuration is supported, so always run this.
     self.do_run(open(path_from_root('tests', 'asmjs-unknown-emscripten.c')).read(), '')
 
+  @no_wasm_backend('printf is incorrectly handling float values')
   def test_cube2md5(self):
     self.emcc_args += ['--embed-file', 'cube2md5.txt']
     shutil.copyfile(path_from_root('tests', 'cube2md5.txt'), os.path.join(self.get_dir(), 'cube2md5.txt'))
     self.do_run(open(path_from_root('tests', 'cube2md5.cpp')).read(), open(path_from_root('tests', 'cube2md5.ok')).read())
 
   def test_cube2hash(self):
-    # extra testing for various codegen modes
-    try:
-      old_chunk_size = os.environ.get('EMSCRIPT_MAX_CHUNK_SIZE') or ''
+    # A good test of i64 math
+    self.do_run('', 'Usage: hashstring <seed>',
+                libraries=self.get_library('cube2hash', ['cube2hash.bc'], configure=None),
+                includes=[path_from_root('tests', 'cube2hash')])
 
-      for chunk_size in ['1', old_chunk_size]: # test splitting out each function to a chunk in emscripten.py (21 functions here)
-        print '  chunks', chunk_size
-        os.environ['EMSCRIPT_MAX_CHUNK_SIZE'] = chunk_size
-
-        # A good test of i64 math
-        self.do_run('', 'Usage: hashstring <seed>',
-                    libraries=self.get_library('cube2hash', ['cube2hash.bc'], configure=None),
-                    includes=[path_from_root('tests', 'cube2hash')])
-
-        for text, output in [('fleefl', '892BDB6FD3F62E863D63DA55851700FDE3ACF30204798CE9'),
-                             ('fleefl2', 'AA2CC5F96FC9D540CA24FDAF1F71E2942753DB83E8A81B61'),
-                             ('64bitisslow', '64D8470573635EC354FEE7B7F87C566FCAF1EFB491041670')]:
-          self.do_run('', 'hash value: ' + output, [text], no_build=True)
-    finally:
-      os.environ['EMSCRIPT_MAX_CHUNK_SIZE'] = old_chunk_size
+    for text, output in [('fleefl', '892BDB6FD3F62E863D63DA55851700FDE3ACF30204798CE9'),
+                         ('fleefl2', 'AA2CC5F96FC9D540CA24FDAF1F71E2942753DB83E8A81B61'),
+                         ('64bitisslow', '64D8470573635EC354FEE7B7F87C566FCAF1EFB491041670')]:
+      self.do_run('', 'hash value: ' + output, [text], no_build=True)
 
   def test_unaligned(self):
       return self.skip('LLVM marks the reads of s as fully aligned, making this test invalid')
       src = r'''
-        #include<stdio.h>
+        #include <stdio.h>
 
         struct S {
           double x;
@@ -565,7 +289,7 @@ class T(RunnerCore): # Short name, to make it more fun to use manually on the co
           printf("*%d*\n", *r);
           long long *t = (long long*)p;
           *t = 42949672960;
-          printf("*%Ld*\n", *t);
+          printf("*%lld*\n", *t);
           return 0;
         }
       '''
@@ -623,6 +347,40 @@ class T(RunnerCore): # Short name, to make it more fun to use manually on the co
 16,24,24,24
 0.00,10,123.46,0.00 : 0.00,10,123.46,0.00
 ''')
+
+  @no_wasm_backend('specific alignment semantics may be asmjs-specific?')
+  def test_align_moar(self):
+    self.emcc_args = self.emcc_args + ['-msse']
+    def test():
+      # hardcoded addresses, for 2 common global_base values.
+      # this tracks if this ever changes by surprise. will need normal updates.
+      self.do_run(r'''
+#include <xmmintrin.h>
+#include <stdio.h>
+
+struct __attribute__((aligned(16))) float4x4
+{
+    union
+    {
+        float v[4][4];
+        __m128 row[4];
+    };
+};
+
+float4x4 v;
+__m128 m;
+
+int main()
+{
+    printf("Alignment: %d addr: 0x%x\n", ((int)&v) % 16, (int)&v);
+    printf("Alignment: %d addr: 0x%x\n", ((int)&m) % 16, (int)&m);
+}
+    ''', ('Alignment: 0 addr: 0xa20\nAlignment: 0 addr: 0xa60\n', 'Alignment: 0 addr: 0xe10\nAlignment: 0 addr: 0xe50\n'))
+
+    test()
+    print 'relocatable'
+    Settings.RELOCATABLE = 1
+    test()
 
   def test_unsigned(self):
       src = '''
@@ -709,113 +467,74 @@ class T(RunnerCore): # Short name, to make it more fun to use manually on the co
       self.do_run(src, '*255*\n*65535*\n*-1*\n*-1*\n*-1*')
 
   def test_bitfields(self):
-      test_path = path_from_root('tests', 'core', 'test_bitfields')
-      src, output = (test_path + s for s in ('.in', '.out'))
-
-      self.do_run_from_file(src, output)
+      self.do_run_in_out_file_test('tests', 'core', 'test_bitfields')
 
   def test_floatvars(self):
-    test_path = path_from_root('tests', 'core', 'test_floatvars')
-    src, output = (test_path + s for s in ('.in', '.out'))
-
-    self.do_run_from_file(src, output)
+    self.do_run_in_out_file_test('tests', 'core', 'test_floatvars')
 
   def test_closebitcasts(self):
-    test_path = path_from_root('tests', 'core', 'closebitcasts')
-    src, output = (test_path + s for s in ('.c', '.txt'))
-    self.do_run_from_file(src, output)
+    self.do_run_in_out_file_test('tests', 'core', 'closebitcasts')
 
   def test_fast_math(self):
     Building.COMPILER_TEST_OPTS += ['-ffast-math']
 
-    test_path = path_from_root('tests', 'core', 'test_fast_math')
-    src, output = (test_path + s for s in ('.in', '.out'))
-
-    self.do_run_from_file(src, output, ['5', '6', '8'])
+    self.do_run_in_out_file_test('tests', 'core', 'test_fast_math',
+                                 args=['5', '6', '8'])
 
   def test_zerodiv(self):
-    test_path = path_from_root('tests', 'core', 'test_zerodiv')
-    src, output = (test_path + s for s in ('.in', '.out'))
-
-    self.do_run_from_file(src, output)
+    self.do_run_in_out_file_test('tests', 'core', 'test_zerodiv')
 
   def test_zero_multiplication(self):
-    test_path = path_from_root('tests', 'core', 'test_zero_multiplication')
-    src, output = (test_path + s for s in ('.in', '.out'))
-
-    self.do_run_from_file(src, output)
+    self.do_run_in_out_file_test('tests', 'core', 'test_zero_multiplication')
 
   def test_isnan(self):
-    test_path = path_from_root('tests', 'core', 'test_isnan')
-    src, output = (test_path + s for s in ('.in', '.out'))
-
-    self.do_run_from_file(src, output)
+    self.do_run_in_out_file_test('tests', 'core', 'test_isnan')
 
   def test_globaldoubles(self):
-    test_path = path_from_root('tests', 'core', 'test_globaldoubles')
-    src, output = (test_path + s for s in ('.in', '.out'))
-
-    self.do_run_from_file(src, output)
+    self.do_run_in_out_file_test('tests', 'core', 'test_globaldoubles')
 
   def test_math(self):
-      test_path = path_from_root('tests', 'core', 'test_math')
-      src, output = (test_path + s for s in ('.in', '.out'))
-
-      self.do_run_from_file(src, output)
+      self.do_run_in_out_file_test('tests', 'core', 'test_math')
 
   def test_erf(self):
-      test_path = path_from_root('tests', 'core', 'test_erf')
-      src, output = (test_path + s for s in ('.in', '.out'))
-
-      self.do_run_from_file(src, output)
+      self.do_run_in_out_file_test('tests', 'core', 'test_erf')
 
   def test_math_hyperbolic(self):
       src = open(path_from_root('tests', 'hyperbolic', 'src.c'), 'r').read()
       expected = open(path_from_root('tests', 'hyperbolic', 'output.txt'), 'r').read()
       self.do_run(src, expected)
 
+  @no_wasm_backend()
   def test_math_lgamma(self):
       test_path = path_from_root('tests', 'math', 'lgamma')
-      src, output = (test_path + s for s in ('.in', '.out'))
+      src, output = (test_path + s for s in ('.c', '.out'))
 
       self.do_run_from_file(src, output)
 
-      print 'main module'
-      Settings.MAIN_MODULE = 1
-      self.do_run_from_file(src, output)
+      if Settings.ALLOW_MEMORY_GROWTH == 0 and not self.is_wasm():
+        print 'main module'
+        Settings.MAIN_MODULE = 1
+        self.do_run_from_file(src, output)
 
   def test_frexp(self):
-      test_path = path_from_root('tests', 'core', 'test_frexp')
-      src, output = (test_path + s for s in ('.in', '.out'))
-
-      self.do_run_from_file(src, output)
+      self.do_run_in_out_file_test('tests', 'core', 'test_frexp')
 
   def test_rounding(self):
-      Settings.PRECISE_F32 = 1 # in the move to llvm 3.7, froundf in musl became more sensitive to float/double differences
+      for precise_f32 in [0, 1]:
+        print precise_f32
+        Settings.PRECISE_F32 = precise_f32
 
-      test_path = path_from_root('tests', 'core', 'test_rounding')
-      src, output = (test_path + s for s in ('.in', '.out'))
-
-      self.do_run_from_file(src, output)
+        self.do_run_in_out_file_test('tests', 'core', 'test_rounding')
 
   def test_fcvt(self):
-      test_path = path_from_root('tests', 'core', 'test_fcvt')
-      src, output = (test_path + s for s in ('.in', '.out'))
-
-      self.do_run_from_file(src, output)
+      self.do_run_in_out_file_test('tests', 'core', 'test_fcvt')
 
   def test_llrint(self):
-    test_path = path_from_root('tests', 'core', 'test_llrint')
-    src, output = (test_path + s for s in ('.in', '.out'))
-
-    self.do_run_from_file(src, output)
+    self.do_run_in_out_file_test('tests', 'core', 'test_llrint')
 
   def test_getgep(self):
     # Generated code includes getelementptr (getelementptr, 0, 1), i.e., GEP as the first param to GEP
-    test_path = path_from_root('tests', 'core', 'test_getgep')
-    src, output = (test_path + s for s in ('.in', '.out'))
-
-    self.do_run_from_file(src, output)
+    self.do_run_in_out_file_test('tests', 'core', 'test_getgep')
 
   def test_multiply_defined_symbols(self):
     a1 = "int f() { return 1; }"
@@ -858,33 +577,20 @@ class T(RunnerCore): # Short name, to make it more fun to use manually on the co
     self.do_ll_run(all_name, 'result: 1')
 
   def test_if(self):
-    test_path = path_from_root('tests', 'core', 'test_if')
-    src, output = (test_path + s for s in ('.in', '.out'))
-
-    self.do_run_from_file(src, output)
+    self.do_run_in_out_file_test('tests', 'core', 'test_if')
 
   def test_if_else(self):
-    test_path = path_from_root('tests', 'core', 'test_if_else')
-    src, output = (test_path + s for s in ('.in', '.out'))
-
-    self.do_run_from_file(src, output)
+    self.do_run_in_out_file_test('tests', 'core', 'test_if_else')
 
   def test_loop(self):
-    test_path = path_from_root('tests', 'core', 'test_loop')
-    src, output = (test_path + s for s in ('.in', '.out'))
-
-    self.do_run_from_file(src, output)
+    self.do_run_in_out_file_test('tests', 'core', 'test_loop')
 
   def test_stack(self):
     Settings.INLINING_LIMIT = 50
 
-    test_path = path_from_root('tests', 'core', 'test_stack')
-    src, output = (test_path + s for s in ('.in', '.out'))
-
-    self.do_run_from_file(src, output)
+    self.do_run_in_out_file_test('tests', 'core', 'test_stack')
 
   def test_stack_align(self):
-    Settings.INLINING_LIMIT = 50
     src = path_from_root('tests', 'core', 'test_stack_align.cpp')
     def test():
       self.do_run(open(src).read(), ['''align 4: 0
@@ -898,11 +604,12 @@ base align: 0, 0, 0, 0'''])
       Settings.OUTLINING_LIMIT = 60
       test()
 
+  @no_emterpreter
   def test_stack_restore(self):
-    if self.is_emterpreter(): return self.skip('generated code not available in emterpreter')
+    if self.is_wasm(): return self.skip('generated code not available in wasm')
     self.emcc_args += ['-g3'] # to be able to find the generated code
     test_path = path_from_root('tests', 'core', 'test_stack_restore')
-    src, output = (test_path + s for s in ('.in', '.out'))
+    src, output = (test_path + s for s in ('.c', '.out'))
 
     self.do_run_from_file(src, output)
 
@@ -919,48 +626,29 @@ base align: 0, 0, 0, 0'''])
     ensure_stack_restore_count('function _stack_usage', 1)
 
   def test_strings(self):
-      test_path = path_from_root('tests', 'core', 'test_strings')
-      src, output = (test_path + s for s in ('.in', '.out'))
+    test_path = path_from_root('tests', 'core', 'test_strings')
+    src, output = (test_path + s for s in ('.c', '.out'))
 
-      self.do_run_from_file(src, output, ['wowie', 'too', '74'])
-
-      if self.emcc_args == []:
-        gen = open(self.in_dir('src.cpp.o.js')).read()
-        assert ('var __str1;' in gen) == named
+    self.do_run_from_file(src, output, ['wowie', 'too', '74'])
 
   def test_strcmp_uni(self):
-    test_path = path_from_root('tests', 'core', 'test_strcmp_uni')
-    src, output = (test_path + s for s in ('.in', '.out'))
-
-    self.do_run_from_file(src, output)
+    self.do_run_in_out_file_test('tests', 'core', 'test_strcmp_uni')
 
   def test_strndup(self):
-    test_path = path_from_root('tests', 'core', 'test_strndup')
-    src, output = (test_path + s for s in ('.in', '.out'))
-
-    self.do_run_from_file(src, output)
+    self.do_run_in_out_file_test('tests', 'core', 'test_strndup')
 
   def test_errar(self):
-    test_path = path_from_root('tests', 'core', 'test_errar')
-    src, output = (test_path + s for s in ('.in', '.out'))
-
-    self.do_run_from_file(src, output)
+    self.do_run_in_out_file_test('tests', 'core', 'test_errar')
 
   def test_mainenv(self):
-    test_path = path_from_root('tests', 'core', 'test_mainenv')
-    src, output = (test_path + s for s in ('.in', '.out'))
-
-    self.do_run_from_file(src, output)
+    self.do_run_in_out_file_test('tests', 'core', 'test_mainenv')
 
   def test_funcs(self):
-    test_path = path_from_root('tests', 'core', 'test_funcs')
-    src, output = (test_path + s for s in ('.in', '.out'))
-
-    self.do_run_from_file(src, output)
+    self.do_run_in_out_file_test('tests', 'core', 'test_funcs')
 
   def test_structs(self):
     test_path = path_from_root('tests', 'core', 'test_structs')
-    src, output = (test_path + s for s in ('.in', '.out'))
+    src, output = (test_path + s for s in ('.c', '.out'))
 
     self.do_run_from_file(src, output)
 
@@ -990,22 +678,13 @@ base align: 0, 0, 0, 0'''])
       self.do_run(self.gen_struct_src.replace('{{gen_struct}}', 'new S').replace('{{del_struct}}', 'delete'), '*51,62*')
 
   def test_addr_of_stacked(self):
-    test_path = path_from_root('tests', 'core', 'test_addr_of_stacked')
-    src, output = (test_path + s for s in ('.in', '.out'))
-
-    self.do_run_from_file(src, output)
+    self.do_run_in_out_file_test('tests', 'core', 'test_addr_of_stacked')
 
   def test_globals(self):
-    test_path = path_from_root('tests', 'core', 'test_globals')
-    src, output = (test_path + s for s in ('.in', '.out'))
-
-    self.do_run_from_file(src, output)
+    self.do_run_in_out_file_test('tests', 'core', 'test_globals')
 
   def test_linked_list(self):
-    test_path = path_from_root('tests', 'core', 'test_linked_list')
-    src, output = (test_path + s for s in ('.in', '.out'))
-
-    self.do_run_from_file(src, output)
+    self.do_run_in_out_file_test('tests', 'core', 'test_linked_list')
 
   def test_sup(self):
       src = '''
@@ -1055,77 +734,50 @@ base align: 0, 0, 0, 0'''])
       self.do_run(src, 'sizeofs:6,8\n*C___: 0,6,12,20<24*\n*Carr: 0,6,12,20<24*\n*C__w: 0,6,12,20<24*\n*Cp1_: 4,6,12,20<24*\n*Cp2_: 0,6,12,20<24*\n*Cint: 0,8,12,20<24*\n*C4__: 0,8,12,20<24*\n*C4_2: 0,6,10,16<20*\n*C__z: 0,8,16,24<28*')
 
   def test_assert(self):
-    test_path = path_from_root('tests', 'core', 'test_assert')
-    src, output = (test_path + s for s in ('.in', '.out'))
-
-    self.do_run_from_file(src, output)
+    self.do_run_in_out_file_test('tests', 'core', 'test_assert')
 
   def test_libcextra(self):
-      test_path = path_from_root('tests', 'core', 'test_libcextra')
-      src, output = (test_path + s for s in ('.in', '.out'))
-
-      self.do_run_from_file(src, output)
+      self.do_run_in_out_file_test('tests', 'core', 'test_libcextra')
 
   def test_regex(self):
-      test_path = path_from_root('tests', 'core', 'test_regex')
-      src, output = (test_path + s for s in ('.in', '.out'))
-
-      self.do_run_from_file(src, output)
+      self.do_run_in_out_file_test('tests', 'core', 'test_regex')
 
   def test_longjmp(self):
-    test_path = path_from_root('tests', 'core', 'test_longjmp')
-    src, output = (test_path + s for s in ('.in', '.out'))
-    self.do_run_from_file(src, output)
+    self.do_run_in_out_file_test('tests', 'core', 'test_longjmp')
 
   def test_longjmp2(self):
-    test_path = path_from_root('tests', 'core', 'test_longjmp2')
-    src, output = (test_path + s for s in ('.in', '.out'))
-    self.do_run_from_file(src, output)
+    self.do_run_in_out_file_test('tests', 'core', 'test_longjmp2')
 
   def test_longjmp3(self):
-    test_path = path_from_root('tests', 'core', 'test_longjmp3')
-    src, output = (test_path + s for s in ('.in', '.out'))
-    self.do_run_from_file(src, output)
+    self.do_run_in_out_file_test('tests', 'core', 'test_longjmp3')
 
   def test_longjmp4(self):
-    test_path = path_from_root('tests', 'core', 'test_longjmp4')
-    src, output = (test_path + s for s in ('.in', '.out'))
-    self.do_run_from_file(src, output)
+    self.do_run_in_out_file_test('tests', 'core', 'test_longjmp4')
 
   def test_longjmp_funcptr(self):
-    test_path = path_from_root('tests', 'core', 'test_longjmp_funcptr')
-    src, output = (test_path + s for s in ('.in', '.out'))
-    self.do_run_from_file(src, output)
+    self.do_run_in_out_file_test('tests', 'core', 'test_longjmp_funcptr')
 
   def test_longjmp_repeat(self):
-    test_path = path_from_root('tests', 'core', 'test_longjmp_repeat')
-    src, output = (test_path + s for s in ('.in', '.out'))
-    self.do_run_from_file(src, output)
+    self.do_run_in_out_file_test('tests', 'core', 'test_longjmp_repeat')
 
   def test_longjmp_stacked(self):
-    test_path = path_from_root('tests', 'core', 'test_longjmp_stacked')
-    src, output = (test_path + s for s in ('.in', '.out'))
-    self.do_run_from_file(src, output)
+    self.do_run_in_out_file_test('tests', 'core', 'test_longjmp_stacked')
 
   def test_longjmp_exc(self):
-    test_path = path_from_root('tests', 'core', 'test_longjmp_exc')
-    src, output = (test_path + s for s in ('.in', '.out'))
-    self.do_run_from_file(src, output)
+    self.do_run_in_out_file_test('tests', 'core', 'test_longjmp_exc')
 
   def test_longjmp_throw(self):
     for disable_throw in [0, 1]:
       print disable_throw
       Settings.DISABLE_EXCEPTION_CATCHING = disable_throw
-      test_path = path_from_root('tests', 'core', 'test_longjmp_throw')
-      src, output = (test_path + s for s in ('.cpp', '.out'))
-      self.do_run_from_file(src, output)
+      self.do_run_in_out_file_test('tests', 'core', 'test_longjmp_throw')
 
   def test_setjmp_many(self):
     src = r'''
       #include <stdio.h>
       #include <setjmp.h>
 
-      int main(int argc) {
+      int main(int argc, char** argv) {
         jmp_buf buf;
         for (int i = 0; i < NUM; i++) printf("%d\n", setjmp(buf));
         if (argc-- == 1131) longjmp(buf, 11);
@@ -1216,7 +868,7 @@ int main() {
       Settings.EXCEPTION_DEBUG = 1
 
       Settings.DISABLE_EXCEPTION_CATCHING = 0
-      if '-O2' in self.emcc_args:
+      if '-O2' in self.emcc_args and not self.is_wasm():
         self.emcc_args += ['--closure', '1'] # Use closure here for some additional coverage
 
       src = '''
@@ -1300,11 +952,12 @@ int main() {
     Settings.DISABLE_EXCEPTION_CATCHING = 0
 
     for safe in [0,1]:
+      # Wasm backend does not support SAFE_HEAP option
+      if self.is_wasm_backend() and safe == 1:
+        continue
       print safe
       Settings.SAFE_HEAP = safe
-      test_path = path_from_root('tests', 'core', 'test_exceptions_2')
-      src, output = (test_path + s for s in ('.in', '.out'))
-      self.do_run_from_file(src, output)
+      self.do_run_in_out_file_test('tests', 'core', 'test_exceptions_2')
 
   def test_exceptions_3(self):
     Settings.DISABLE_EXCEPTION_CATCHING = 0
@@ -1346,11 +999,16 @@ int main(int argc, char **argv)
 
   def test_exceptions_white_list(self):
     Settings.DISABLE_EXCEPTION_CATCHING = 2
-    Settings.EXCEPTION_CATCHING_WHITELIST = ["__Z12somefunctionv"]
+    # Wasm does not add an underscore to function names. For wasm, the
+    # mismatches are fixed in fixImports() function in JS glue code.
+    if not self.is_wasm_backend():
+      Settings.EXCEPTION_CATCHING_WHITELIST = ["__Z12somefunctionv"]
+    else:
+      Settings.EXCEPTION_CATCHING_WHITELIST = ["_Z12somefunctionv"]
     Settings.INLINING_LIMIT = 50 # otherwise it is inlined and not identified
 
     test_path = path_from_root('tests', 'core', 'test_exceptions_white_list')
-    src, output = (test_path + s for s in ('.in', '.out'))
+    src, output = (test_path + s for s in ('.cpp', '.out'))
     self.do_run_from_file(src, output)
     size = len(open('src.cpp.o.js').read())
     shutil.copyfile('src.cpp.o.js', 'orig.js')
@@ -1373,20 +1031,26 @@ int main(int argc, char **argv)
     disabled_size = len(open('src.cpp.o.js').read())
     shutil.copyfile('src.cpp.o.js', 'disabled.js')
 
-    assert size - empty_size > 0.005*size, [empty_size, size] # big change when we disable entirely
-    assert size - fake_size > 0.005*size, [fake_size, size]
-    assert abs(empty_size - fake_size) < 0.007*size, [empty_size, fake_size]
-    assert empty_size - disabled_size < 0.007*size, [empty_size, disabled_size] # full disable removes a little bit more
-    assert fake_size - disabled_size < 0.007*size, [disabled_size, fake_size]
+    if not self.is_wasm():
+      print size, empty_size, fake_size, disabled_size
+
+      assert size - empty_size > 0.0025*size, [empty_size, size] # big change when we disable entirely
+      assert size - fake_size > 0.0025*size, [fake_size, size]
+      assert abs(empty_size - fake_size) < 0.007*size, [empty_size, fake_size]
+      assert empty_size - disabled_size < 0.007*size, [empty_size, disabled_size] # full disable removes a little bit more
+      assert fake_size - disabled_size < 0.007*size, [disabled_size, fake_size]
 
   def test_exceptions_white_list_2(self):
     Settings.DISABLE_EXCEPTION_CATCHING = 2
-    Settings.EXCEPTION_CATCHING_WHITELIST = ["_main"]
-    Settings.INLINING_LIMIT = 50 # otherwise it is inlined and not identified
+    # Wasm does not add an underscore to function names. For wasm, the
+    # mismatches are fixed in fixImports() function in JS glue code.
+    if not self.is_wasm_backend():
+      Settings.EXCEPTION_CATCHING_WHITELIST = ["_main"]
+    else:
+      Settings.EXCEPTION_CATCHING_WHITELIST = ["main"]
+    Settings.INLINING_LIMIT = 1 # otherwise it is inlined and not identified
 
-    test_path = path_from_root('tests', 'core', 'test_exceptions_white_list_2')
-    src, output = (test_path + s for s in ('.c', '.out'))
-    self.do_run_from_file(src, output)
+    self.do_run_in_out_file_test('tests', 'core', 'test_exceptions_white_list_2')
 
   def test_exceptions_uncaught(self):
       Settings.DISABLE_EXCEPTION_CATCHING = 0
@@ -1425,81 +1089,88 @@ int main(int argc, char **argv)
       '''
       self.do_run(src, 'success')
 
+  def test_exceptions_uncaught_2(self):
+      Settings.DISABLE_EXCEPTION_CATCHING = 0
+
+      src = r'''
+        #include <iostream>
+        #include <exception>
+
+        int main() {
+          try {
+              throw std::exception();
+          } catch(std::exception) {
+            try {
+              throw;
+            } catch(std::exception) {}
+          }
+
+          if (std::uncaught_exception())
+            std::cout << "ERROR: uncaught_exception still set.";
+          else
+            std::cout << "OK";
+        }
+      '''
+      self.do_run(src, 'OK\n')
+
   def test_exceptions_typed(self):
     Settings.DISABLE_EXCEPTION_CATCHING = 0
     self.emcc_args += ['-s', 'SAFE_HEAP=0'] # Throwing null will cause an ignorable null pointer access.
 
-    test_path = path_from_root('tests', 'core', 'test_exceptions_typed')
-    src, output = (test_path + s for s in ('.in', '.out'))
-
-    self.do_run_from_file(src, output)
+    self.do_run_in_out_file_test('tests', 'core', 'test_exceptions_typed')
 
   def test_exceptions_virtual_inheritance(self):
     Settings.DISABLE_EXCEPTION_CATCHING = 0
 
-    test_path = path_from_root('tests', 'core', 'test_exceptions_virtual_inheritance')
-    src, output = (test_path + s for s in ('.cpp', '.txt'))
-
-    self.do_run_from_file(src, output)
+    self.do_run_in_out_file_test('tests', 'core', 'test_exceptions_virtual_inheritance')
 
   def test_exceptions_convert(self):
     Settings.DISABLE_EXCEPTION_CATCHING = 0
-    test_path = path_from_root('tests', 'core', 'test_exceptions_convert')
-    src, output = (test_path + s for s in ('.cpp', '.txt'))
-    self.do_run_from_file(src, output)
+    self.do_run_in_out_file_test('tests', 'core', 'test_exceptions_convert')
 
   def test_exceptions_multi(self):
     Settings.DISABLE_EXCEPTION_CATCHING = 0
-    test_path = path_from_root('tests', 'core', 'test_exceptions_multi')
-    src, output = (test_path + s for s in ('.in', '.out'))
-    self.do_run_from_file(src, output)
+    self.do_run_in_out_file_test('tests', 'core', 'test_exceptions_multi')
 
   def test_exceptions_std(self):
     Settings.DISABLE_EXCEPTION_CATCHING = 0
     Settings.ERROR_ON_UNDEFINED_SYMBOLS = 1
     self.emcc_args += ['-s', 'SAFE_HEAP=0']
 
-    test_path = path_from_root('tests', 'core', 'test_exceptions_std')
-    src, output = (test_path + s for s in ('.in', '.out'))
-
-    self.do_run_from_file(src, output)
+    self.do_run_in_out_file_test('tests', 'core', 'test_exceptions_std')
 
   def test_exceptions_alias(self):
     Settings.DISABLE_EXCEPTION_CATCHING = 0
-    test_path = path_from_root('tests', 'core', 'test_exceptions_alias')
-    src, output = (test_path + s for s in ('.c', '.out'))
-    self.do_run_from_file(src, output)
+    self.do_run_in_out_file_test('tests', 'core', 'test_exceptions_alias')
 
   def test_exceptions_rethrow(self):
     Settings.DISABLE_EXCEPTION_CATCHING = 0
-    test_path = path_from_root('tests', 'core', 'test_exceptions_rethrow')
-    src, output = (test_path + s for s in ('.cpp', '.txt'))
-    self.do_run_from_file(src, output)
+    self.do_run_in_out_file_test('tests', 'core', 'test_exceptions_rethrow')
 
   def test_exceptions_resume(self):
     Settings.DISABLE_EXCEPTION_CATCHING = 0
     Settings.EXCEPTION_DEBUG = 1
-    test_path = path_from_root('tests', 'core', 'test_exceptions_resume')
-    src, output = (test_path + s for s in ('.cpp', '.txt'))
-    self.do_run_from_file(src, output)
+    self.do_run_in_out_file_test('tests', 'core', 'test_exceptions_resume')
 
   def test_exceptions_destroy_virtual(self):
     Settings.DISABLE_EXCEPTION_CATCHING = 0
-    test_path = path_from_root('tests', 'core', 'test_exceptions_destroy_virtual')
-    src, output = (test_path + s for s in ('.cpp', '.txt'))
-    self.do_run_from_file(src, output)
+    self.do_run_in_out_file_test('tests', 'core', 'test_exceptions_destroy_virtual')
 
   def test_exceptions_refcount(self):
     Settings.DISABLE_EXCEPTION_CATCHING = 0
-    test_path = path_from_root('tests', 'core', 'test_exceptions_refcount')
-    src, output = (test_path + s for s in ('.cpp', '.txt'))
-    self.do_run_from_file(src, output)
+    self.do_run_in_out_file_test('tests', 'core', 'test_exceptions_refcount')
 
   def test_exceptions_primary(self):
     Settings.DISABLE_EXCEPTION_CATCHING = 0
-    test_path = path_from_root('tests', 'core', 'test_exceptions_primary')
-    src, output = (test_path + s for s in ('.cpp', '.txt'))
-    self.do_run_from_file(src, output)
+    self.do_run_in_out_file_test('tests', 'core', 'test_exceptions_primary')
+
+  def test_exceptions_simplify_cfg(self):
+    Settings.DISABLE_EXCEPTION_CATCHING = 0
+    self.do_run_in_out_file_test('tests', 'core', 'test_exceptions_simplify_cfg')
+
+  def test_exceptions_libcxx(self):
+    Settings.DISABLE_EXCEPTION_CATCHING = 0
+    self.do_run_in_out_file_test('tests', 'core', 'test_exceptions_libcxx')
 
   def test_bad_typeid(self):
     Settings.ERROR_ON_UNDEFINED_SYMBOLS = 1
@@ -1517,7 +1188,7 @@ int main () {
   try
   {
     Polymorphic * pb = 0;
-    typeid(*pb);  // throws a bad_typeid exception
+    const std::type_info& ti = typeid(*pb);  // throws a bad_typeid exception
   }
   catch (std::exception& e)
   {
@@ -1527,112 +1198,41 @@ int main () {
 }
     ''', 'exception caught: std::bad_typeid')
 
-  def test_exit_stack(self):
-    if Settings.ASM_JS: return self.skip('uses report_stack without exporting')
+  def test_iostream_ctors(self): # iostream stuff must be globally constructed before user global constructors, so iostream works in global constructors
+    self.do_run(r'''
+#include <iostream>
 
-    Settings.INLINING_LIMIT = 50
-    Settings.NO_EXIT_RUNTIME = 1
+struct A {
+  A() { std::cout << "bug"; }
+};
+A a;
 
-    src = r'''
-      #include <stdio.h>
-      #include <stdlib.h>
-
-      extern "C" {
-        extern void report_stack(int x);
-      }
-
-      char moar() {
-        char temp[125];
-        for (int i = 0; i < 125; i++) temp[i] = i*i;
-        for (int i = 1; i < 125; i++) temp[i] += temp[i-1]/2;
-        if (temp[100] != 99) exit(1);
-        return temp[120];
-      }
-
-      int main(int argc, char *argv[]) {
-        report_stack((int)alloca(4));
-        printf("*%d*\n", moar());
-        return 0;
-      }
-    '''
-
-    open(os.path.join(self.get_dir(), 'pre.js'), 'w').write('''
-      var initialStack = -1;
-      var _report_stack = function(x) {
-        Module.print('reported');
-        initialStack = x;
-      }
-      var Module = {
-        postRun: function() {
-          Module.print('Exit Status: ' + EXITSTATUS);
-          Module.print('postRun');
-          assert(initialStack == STACKTOP, [initialStack, STACKTOP]);
-          Module.print('ok.');
-        }
-      };
-    ''')
-
-    self.emcc_args += ['--pre-js', 'pre.js']
-    self.do_run(src, '''reported\n*0*\nExit Status: 0\npostRun\nok.\n''')
+int main() {
+  std::cout << "free code" << std::endl;
+  return 0;
+}
+''', "bugfree code")
 
   def test_class(self):
-    test_path = path_from_root('tests', 'core', 'test_class')
-    src, output = (test_path + s for s in ('.in', '.out'))
-
-    self.do_run_from_file(src, output)
+    self.do_run_in_out_file_test('tests', 'core', 'test_class')
 
   def test_inherit(self):
-    test_path = path_from_root('tests', 'core', 'test_inherit')
-    src, output = (test_path + s for s in ('.in', '.out'))
-
-    self.do_run_from_file(src, output)
+    self.do_run_in_out_file_test('tests', 'core', 'test_inherit')
 
   def test_isdigit_l(self):
-      test_path = path_from_root('tests', 'core', 'test_isdigit_l')
-      src, output = (test_path + s for s in ('.in', '.out'))
-
-      self.do_run_from_file(src, output)
+      self.do_run_in_out_file_test('tests', 'core', 'test_isdigit_l')
 
   def test_iswdigit(self):
-      test_path = path_from_root('tests', 'core', 'test_iswdigit')
-      src, output = (test_path + s for s in ('.in', '.out'))
-
-      self.do_run_from_file(src, output)
+      self.do_run_in_out_file_test('tests', 'core', 'test_iswdigit')
 
   def test_polymorph(self):
-      test_path = path_from_root('tests', 'core', 'test_polymorph')
-      src, output = (test_path + s for s in ('.in', '.out'))
+      self.do_run_in_out_file_test('tests', 'core', 'test_polymorph')
 
-      self.do_run_from_file(src, output)
-
+  @no_wasm_backend('no support for complex math division yet')
   def test_complex(self):
-    self.do_run(r'''
-#include <complex.h>
-#include <stdio.h>
+    self.do_run_in_out_file_test('tests', 'core', 'test_complex', force_c=True)
 
-int main(int argc, char**argv)
-{
-   float complex z1 = 1.0 + 3.0 * I;
-   printf("value = real %.2f imag %.2f\n",creal(z1),cimag(z1));
-   float abs_value = cabsf(z1);
-   printf("abs = %.2f\n",abs_value);
-   float complex z2 =  conjf(z1); 
-   printf("value = real %.2f imag %.2f\n",creal(z2),cimag(z2));
-   float complex z3 =  cexpf(z1); 
-   printf("value = real %.2f imag %.2f\n",creal(z3),cimag(z3));
-   float complex z4 =  conj(z1); 
-   printf("value = real %.2f imag %.2f\n",creal(z4),cimag(z4));
-   float complex z5 =  cargf(z1); 
-   printf("value = real %.2f imag %.2f\n",creal(z5),cimag(z5));
-   return 0;
-}
-''', '''value = real 1.00 imag 3.00
-abs = 3.16
-value = real 1.00 imag -3.00
-value = real -2.69 imag 0.38
-value = real 1.00 imag -3.00
-value = real 1.25 imag 0.00''', force_c=True)
-
+  @no_wasm_backend("wasm backend doesn't add Runtime.setDynamicTop and crashes")
   def test_segfault(self):
     Settings.SAFE_HEAP = 1
 
@@ -1665,88 +1265,54 @@ value = real 1.25 imag 0.00''', force_c=True)
       self.do_run(src, 'segmentation fault' if addr.isdigit() else 'marfoosh')
 
   def test_dynamic_cast(self):
-      test_path = path_from_root('tests', 'core', 'test_dynamic_cast')
-      src, output = (test_path + s for s in ('.in', '.out'))
-
-      self.do_run_from_file(src, output)
+      self.do_run_in_out_file_test('tests', 'core', 'test_dynamic_cast')
 
   def test_dynamic_cast_b(self):
-      test_path = path_from_root('tests', 'core', 'test_dynamic_cast_b')
-      src, output = (test_path + s for s in ('.in', '.out'))
-
-      self.do_run_from_file(src, output)
+      self.do_run_in_out_file_test('tests', 'core', 'test_dynamic_cast_b')
 
   def test_dynamic_cast_2(self):
-    test_path = path_from_root('tests', 'core', 'test_dynamic_cast_2')
-    src, output = (test_path + s for s in ('.in', '.out'))
-
-    self.do_run_from_file(src, output)
+    self.do_run_in_out_file_test('tests', 'core', 'test_dynamic_cast_2')
 
   def test_funcptr(self):
-    test_path = path_from_root('tests', 'core', 'test_funcptr')
-    src, output = (test_path + s for s in ('.in', '.out'))
-
-    self.do_run_from_file(src, output)
+    self.do_run_in_out_file_test('tests', 'core', 'test_funcptr')
 
   def test_mathfuncptr(self):
-    test_path = path_from_root('tests', 'core', 'test_mathfuncptr')
-    src, output = (test_path + s for s in ('.in', '.out'))
-
-    self.do_run_from_file(src, output)
+    self.do_run_in_out_file_test('tests', 'core', 'test_mathfuncptr')
 
     if self.is_emterpreter():
       print 'emterpreter f32'
       Settings.PRECISE_F32 = 1
-      self.do_run_from_file(src, output)
+      self.do_run_in_out_file_test('tests', 'core', 'test_mathfuncptr')
 
   def test_funcptrfunc(self):
-    test_path = path_from_root('tests', 'core', 'test_funcptrfunc')
-    src, output = (test_path + s for s in ('.in', '.out'))
-
-    self.do_run_from_file(src, output)
+    self.do_run_in_out_file_test('tests', 'core', 'test_funcptrfunc')
 
   def test_funcptr_namecollide(self):
-    test_path = path_from_root('tests', 'core', 'test_funcptr_namecollide')
-    src, output = (test_path + s for s in ('.in', '.out'))
-
-    self.do_run_from_file(src, output, force_c=True)
+    self.do_run_in_out_file_test('tests', 'core', 'test_funcptr_namecollide')
 
   def test_emptyclass(self):
-      test_path = path_from_root('tests', 'core', 'test_emptyclass')
-      src, output = (test_path + s for s in ('.in', '.out'))
-
-      self.do_run_from_file(src, output)
+    self.do_run_in_out_file_test('tests', 'core', 'test_emptyclass')
 
   def test_alloca(self):
-    test_path = path_from_root('tests', 'core', 'test_alloca')
-    src, output = (test_path + s for s in ('.in', '.out'))
-
-    self.do_run_from_file(src, output, force_c=True)
+    self.do_run_in_out_file_test('tests', 'core', 'test_alloca')
 
   def test_rename(self):
-    src = open(path_from_root('tests', 'stdio', 'test_rename.c'), 'r').read()
-    self.do_run(src, 'success', force_c=True)
+    self.do_run_in_out_file_test('tests', 'stdio', 'test_rename', force_c=True)
+
+  def test_remove(self):
+    self.do_run_in_out_file_test('tests', 'cstdio', 'test_remove')
 
   def test_alloca_stack(self):
-    test_path = path_from_root('tests', 'core', 'test_alloca_stack')
-    src, output = (test_path + s for s in ('.in', '.out'))
-
-    self.do_run_from_file(src, output, force_c=True)
+    self.do_run_in_out_file_test('tests', 'core', 'test_alloca_stack')
 
   def test_stack_byval(self):
-    test_path = path_from_root('tests', 'core', 'test_stack_byval')
-    src, output = (test_path + s for s in ('.in', '.out'))
-
-    self.do_run_from_file(src, output)
+    self.do_run_in_out_file_test('tests', 'core', 'test_stack_byval')
 
   def test_stack_varargs(self):
     Settings.INLINING_LIMIT = 50
-    Settings.TOTAL_STACK = 1024
+    Settings.TOTAL_STACK = 2048
 
-    test_path = path_from_root('tests', 'core', 'test_stack_varargs')
-    src, output = (test_path + s for s in ('.in', '.out'))
-
-    self.do_run_from_file(src, output)
+    self.do_run_in_out_file_test('tests', 'core', 'test_stack_varargs')
 
   def test_stack_varargs2(self):
     Settings.TOTAL_STACK = 1536
@@ -1826,11 +1392,10 @@ value = real 1.25 imag 0.00''', force_c=True)
   def test_stack_void(self):
     Settings.INLINING_LIMIT = 50
 
-    test_path = path_from_root('tests', 'core', 'test_stack_void')
-    src, output = (test_path + s for s in ('.in', '.out'))
+    self.do_run_in_out_file_test('tests', 'core', 'test_stack_void')
 
-    self.do_run_from_file(src, output)
-
+  # Fails in wasm because of excessive slowness in the wasm-shell
+  @no_wasm
   def test_life(self):
     self.emcc_args += ['-std=c99']
     src = open(path_from_root('tests', 'life.c'), 'r').read()
@@ -1871,104 +1436,27 @@ value = real 1.25 imag 0.00''', force_c=True)
 ''', ['2'], force_c=True)
 
   def test_array2(self):
-    test_path = path_from_root('tests', 'core', 'test_array2')
-    src, output = (test_path + s for s in ('.in', '.out'))
-
-    self.do_run_from_file(src, output)
+    self.do_run_in_out_file_test('tests', 'core', 'test_array2')
 
   def test_array2b(self):
-    test_path = path_from_root('tests', 'core', 'test_array2b')
-    src, output = (test_path + s for s in ('.in', '.out'))
-
-    self.do_run_from_file(src, output)
+    self.do_run_in_out_file_test('tests', 'core', 'test_array2b')
 
   def test_constglobalstructs(self):
-    test_path = path_from_root('tests', 'core', 'test_constglobalstructs')
-    src, output = (test_path + s for s in ('.in', '.out'))
-
-    self.do_run_from_file(src, output)
+    self.do_run_in_out_file_test('tests', 'core', 'test_constglobalstructs')
 
   def test_conststructs(self):
-    test_path = path_from_root('tests', 'core', 'test_conststructs')
-    src, output = (test_path + s for s in ('.in', '.out'))
-
-    self.do_run_from_file(src, output)
+    self.do_run_in_out_file_test('tests', 'core', 'test_conststructs')
 
   def test_bigarray(self):
-    test_path = path_from_root('tests', 'core', 'test_bigarray')
-    src, output = (test_path + s for s in ('.in', '.out'))
-
-    self.do_run_from_file(src, output)
+    self.do_run_in_out_file_test('tests', 'core', 'test_bigarray')
 
   def test_mod_globalstruct(self):
-    test_path = path_from_root('tests', 'core', 'test_mod_globalstruct')
-    src, output = (test_path + s for s in ('.in', '.out'))
+    self.do_run_in_out_file_test('tests', 'core', 'test_mod_globalstruct')
 
-    self.do_run_from_file(src, output)
-
+  @no_wasm_backend('long doubles are f128s in wasm backend')
   def test_pystruct(self):
-      src = '''
-        #include <stdio.h>
-
-        // Based on CPython code
-        union PyGC_Head {
-            struct {
-                union PyGC_Head *gc_next;
-                union PyGC_Head *gc_prev;
-                size_t gc_refs;
-            } gc;
-            long double dummy;  /* force worst-case alignment */
-        } ;
-
-        struct gc_generation {
-            PyGC_Head head;
-            int threshold; /* collection threshold */
-            int count; /* count of allocations or collections of younger
-                          generations */
-        };
-
-        #define NUM_GENERATIONS 3
-        #define GEN_HEAD(n) (&generations[n].head)
-
-        /* linked lists of container objects */
-        static struct gc_generation generations[NUM_GENERATIONS] = {
-            /* PyGC_Head,                               threshold,      count */
-            {{{GEN_HEAD(0), GEN_HEAD(0), 0}},           700,            0},
-            {{{GEN_HEAD(1), GEN_HEAD(1), 0}},           10,             0},
-            {{{GEN_HEAD(2), GEN_HEAD(2), 0}},           10,             0},
-        };
-
-        int main()
-        {
-          gc_generation *n = NULL;
-          printf("*%d,%d,%d,%d,%d,%d,%d,%d*\\n",
-            (int)(&n[0]),
-            (int)(&n[0].head),
-            (int)(&n[0].head.gc.gc_next),
-            (int)(&n[0].head.gc.gc_prev),
-            (int)(&n[0].head.gc.gc_refs),
-            (int)(&n[0].threshold), (int)(&n[0].count), (int)(&n[1])
-          );
-          printf("*%d,%d,%d*\\n",
-            (int)(&generations[0]) ==
-            (int)(&generations[0].head.gc.gc_next),
-            (int)(&generations[0]) ==
-            (int)(&generations[0].head.gc.gc_prev),
-            (int)(&generations[0]) ==
-            (int)(&generations[1])
-          );
-          int x1 = (int)(&generations[0]);
-          int x2 = (int)(&generations[1]);
-          printf("*%d*\\n", x1 == x2);
-          for (int i = 0; i < NUM_GENERATIONS; i++) {
-            PyGC_Head *list = GEN_HEAD(i);
-            printf("%d:%d,%d\\n", i, (int)list == (int)(list->gc.gc_prev), (int)list ==(int)(list->gc.gc_next));
-          }
-          printf("*%d,%d,%d*\\n", sizeof(PyGC_Head), sizeof(gc_generation), int(GEN_HEAD(2)) - int(GEN_HEAD(1)));
-        }
-      '''
       def test():
-        self.do_run(src, '*0,0,0,4,8,16,20,24*\n*1,0,0*\n*0*\n0:1,1\n1:1,1\n2:1,1\n*16,24,24*')
+        self.do_run_in_out_file_test('tests', 'test_pystruct')
 
       test()
 
@@ -1983,53 +1471,57 @@ value = real 1.25 imag 0.00''', force_c=True)
       def check_warnings(output):
           runner.assertEquals(filter(lambda line: 'Warning' in line, output.split('\n')).__len__(), 4)
 
-      test_path = path_from_root('tests', 'core', 'test_ptrtoint')
-      src, output = (test_path + s for s in ('.in', '.out'))
-
-      self.do_run_from_file(src, output, output_processor=check_warnings)
+      self.do_run_in_out_file_test('tests', 'core', 'test_ptrtoint',
+                                   output_processor=check_warnings)
 
   def test_sizeof(self):
       # Has invalid writes between printouts
       Settings.SAFE_HEAP = 0
 
-      test_path = path_from_root('tests', 'core', 'test_sizeof')
-      src, output = (test_path + s for s in ('.in', '.out'))
-
-      self.do_run_from_file(src, output, [], lambda x, err: x.replace('\n', '*'))
+      self.do_run_in_out_file_test('tests', 'core', 'test_sizeof')
 
   def test_llvm_used(self):
     Building.LLVM_OPTS = 3
 
-    test_path = path_from_root('tests', 'core', 'test_llvm_used')
-    src, output = (test_path + s for s in ('.in', '.out'))
-
-    self.do_run_from_file(src, output)
+    self.do_run_in_out_file_test('tests', 'core', 'test_llvm_used')
 
   def test_set_align(self):
     Settings.SAFE_HEAP = 1
 
-    test_path = path_from_root('tests', 'core', 'test_set_align')
-    src, output = (test_path + s for s in ('.c', '.out'))
-    self.do_run_from_file(src, output)
+    self.do_run_in_out_file_test('tests', 'core', 'test_set_align')
 
+  @no_wasm_backend('printf is incorrectly handling float values')
   def test_emscripten_api(self):
-      #if Building.LLVM_OPTS: return self.skip('FIXME')
-
-      test_path = path_from_root('tests', 'core', 'test_emscripten_api')
-      src, output = (test_path + s for s in ('.in', '.out'))
-
       check = '''
 def process(filename):
   src = open(filename, 'r').read()
   # TODO: restore this (see comment in emscripten.h) assert '// hello from the source' in src
 '''
       Settings.EXPORTED_FUNCTIONS = ['_main', '_save_me_aimee']
-      self.do_run_from_file(src, output, post_build=check)
+      self.do_run_in_out_file_test('tests', 'core', 'test_emscripten_api',
+                                   post_build=check)
 
       # test EXPORT_ALL
       Settings.EXPORTED_FUNCTIONS = []
       Settings.EXPORT_ALL = 1
-      self.do_run_from_file(src, output, post_build=check)
+      Settings.LINKABLE = 1
+      self.do_run_in_out_file_test('tests', 'core', 'test_emscripten_api',
+                                   post_build=check)
+
+  def test_emscripten_run_script_string_utf8(self):
+    src = r'''
+      #include <stdio.h>
+      #include <stdlib.h>
+      #include <string.h>
+      #include <emscripten.h>
+
+      int main() {
+        const char *str = emscripten_run_script_string("'\\u2603 \\u2603 \\u2603 Hello!'");
+        printf("length of returned string: %d. Position of substring 'Hello': %d\n", strlen(str), strstr(str, "Hello")-str);
+        return 0;
+      }
+    '''
+    self.do_run(src, '''length of returned string: 18. Position of substring 'Hello': 12''')
 
   def test_emscripten_get_now(self):
     self.banned_js_engines = [V8_ENGINE] # timer limitations in v8 shell
@@ -2049,10 +1541,7 @@ def process(filename):
   def test_inlinejs(self):
       return self.skip('non-fastcomp is deprecated and fails in 3.5') # only supports EM_ASM
 
-      test_path = path_from_root('tests', 'core', 'test_inlinejs')
-      src, output = (test_path + s for s in ('.in', '.out'))
-
-      self.do_run_from_file(src, output)
+      self.do_run_in_out_file_test('tests', 'core', 'test_inlinejs')
 
       if self.emcc_args == []: # opts will eliminate the comments
         out = open('src.cpp.o.js').read()
@@ -2062,14 +1551,13 @@ def process(filename):
   def test_inlinejs2(self):
       return self.skip('non-fastcomp is deprecated and fails in 3.5') # only supports EM_ASM
 
-      test_path = path_from_root('tests', 'core', 'test_inlinejs2')
-      src, output = (test_path + s for s in ('.in', '.out'))
-
-      self.do_run_from_file(src, output)
+      self.do_run_in_out_file_test('tests', 'core', 'test_inlinejs2')
 
   def test_inlinejs3(self):
+    if self.is_wasm(): return self.skip('wasm requires a proper asm module')
+
     test_path = path_from_root('tests', 'core', 'test_inlinejs3')
-    src, output = (test_path + s for s in ('.in', '.out'))
+    src, output = (test_path + s for s in ('.c', '.out'))
 
     self.do_run_from_file(src, output)
 
@@ -2106,50 +1594,57 @@ int main() {
 }
 ''', 'hello world…')
 
-  def test_memorygrowth(self):
-    self.banned_js_engines = [V8_ENGINE] # stderr printing limitations in v8
+  @no_wasm_backend('requires EM_ASM args support in wasm backend')
+  def test_em_asm_unused_arguments(self):
+    src = r'''
+      #include <stdio.h>
+      #include <emscripten.h>
 
+      int main(int argc, char **argv) {
+        int sum = EM_ASM_INT({
+           return $0 + $2;
+        }, 0, 1, 2);
+        printf("0+2=%d\n", sum);
+        return 0;
+      }
+    '''
+    self.do_run(src, '''0+2=2''')
+
+  # Verify that EM_ASM macros support getting called with multiple arities.
+  # Maybe tests will later be joined into larger compilation units?
+  # Then this must still be compiled separately from other code using EM_ASM
+  # macros with arities 1-3. Otherwise this may incorrectly report a success.
+  @no_wasm_backend('requires EM_ASM args support in wasm backend')
+  def test_em_asm_parameter_pack(self):
+    Building.COMPILER_TEST_OPTS += ['-std=c++11']
+    src = r'''
+      #include <emscripten.h>
+
+      template <typename... Args>
+      int call(Args... args) {
+        return(EM_ASM_INT(
+          {
+            Module.print(Array.prototype.join.call(arguments, ','));
+          },
+          args...
+        ));
+      }
+
+      int main(int argc, char **argv) {
+        call(1);
+        call(1, 2);
+        call(1, 2, 3);
+        return 0;
+      }
+    '''
+    self.do_run(src, '''1\n1,2\n1,2,3''')
+
+  def test_memorygrowth(self):
     self.emcc_args += ['-s', 'ALLOW_MEMORY_GROWTH=0'] # start with 0
 
     # With typed arrays in particular, it is dangerous to use more memory than TOTAL_MEMORY,
     # since we then need to enlarge the heap(s).
-    src = r'''
-      #include <stdio.h>
-      #include <stdlib.h>
-      #include <string.h>
-      #include <assert.h>
-      #include "emscripten.h"
-
-      int main(int argc, char **argv)
-      {
-        char *buf1 = (char*)malloc(100);
-        char *data1 = "hello";
-        memcpy(buf1, data1, strlen(data1)+1);
-
-        float *buf2 = (float*)malloc(100);
-        float pie = 4.955;
-        memcpy(buf2, &pie, sizeof(float));
-
-        printf("*pre: %s,%.3f*\n", buf1, buf2[0]);
-
-        int totalMemory = emscripten_run_script_int("TOTAL_MEMORY");
-        char *buf3 = (char*)malloc(totalMemory+1);
-        buf3[argc] = (int)buf2;
-        if (argc % 7 == 6) printf("%d\n", memcpy(buf3, buf1, argc));
-        char *buf4 = (char*)malloc(100);
-        float *buf5 = (float*)malloc(100);
-        //printf("totalMemory: %d bufs: %d,%d,%d,%d,%d\n", totalMemory, buf1, buf2, buf3, buf4, buf5);
-        assert((int)buf4 > (int)totalMemory && (int)buf5 > (int)totalMemory);
-
-        printf("*%s,%.3f*\n", buf1, buf2[0]); // the old heap data should still be there
-
-        memcpy(buf4, buf1, strlen(data1)+1);
-        memcpy(buf5, buf2, sizeof(float));
-        printf("*%s,%.3f*\n", buf4, buf5[0]); // and the new heap space should work too
-
-        return 0;
-      }
-    '''
+    src = open(path_from_root('tests', 'core', 'test_memorygrowth.c')).read()
 
     # Fail without memory growth
     self.do_run(src, 'Cannot enlarge memory arrays.')
@@ -2167,6 +1662,47 @@ int main() {
       win = win[win.find(code_start):]
       assert len(fail) < len(win), 'failing code - without memory growth on - is more optimized, and smaller' + str([len(fail), len(win)])
 
+    # Tracing of memory growths should work
+    Settings.EMSCRIPTEN_TRACING = 1
+    self.emcc_args += ['--tracing']
+    self.do_run(src, '*pre: hello,4.955*\n*hello,4.955*\n*hello,4.955*')
+
+  def test_memorygrowth_2(self):
+    self.emcc_args += ['-s', 'ALLOW_MEMORY_GROWTH=0'] # start with 0
+
+    emcc_args = self.emcc_args[:]
+
+    def test():
+      self.emcc_args = emcc_args[:]
+
+      # With typed arrays in particular, it is dangerous to use more memory than TOTAL_MEMORY,
+      # since we then need to enlarge the heap(s).
+      src = open(path_from_root('tests', 'core', 'test_memorygrowth_2.c')).read()
+
+      # Fail without memory growth
+      self.do_run(src, 'Cannot enlarge memory arrays.')
+      fail = open('src.cpp.o.js').read()
+
+      # Win with it
+      self.emcc_args += ['-s', 'ALLOW_MEMORY_GROWTH=1']
+      self.do_run(src, '*pre: hello,4.955*\n*hello,4.955*\n*hello,4.955*')
+      win = open('src.cpp.o.js').read()
+
+      if '-O2' in self.emcc_args:
+        # Make sure ALLOW_MEMORY_GROWTH generates different code (should be less optimized)
+        code_start = 'var TOTAL_MEMORY'
+        fail = fail[fail.find(code_start):]
+        win = win[win.find(code_start):]
+        assert len(fail) < len(win), 'failing code - without memory growth on - is more optimized, and smaller' + str([len(fail), len(win)])
+
+    test()
+
+    if not self.is_wasm():
+      print 'split memory'
+      Settings.SPLIT_MEMORY = 16*1024*1024
+      test()
+      Settings.SPLIT_MEMORY = 0
+
   def test_ssr(self): # struct self-ref
       src = '''
         #include <stdio.h>
@@ -2179,7 +1715,7 @@ int main() {
           struct opj_mqc_state *nlps;
         } opj_mqc_state_t;
 
-        static opj_mqc_state_t mqc_states[2] = {
+        static opj_mqc_state_t mqc_states[4] = {
           {0x5600, 0, &mqc_states[2], &mqc_states[3]},
           {0x5602, 1, &mqc_states[3], &mqc_states[2]},
         };
@@ -2195,53 +1731,46 @@ int main() {
       self.do_run(src, '''*16*\n0:22016,0,32,48\n1:22018,1,48,32\n''')
 
   def test_tinyfuncstr(self):
-      test_path = path_from_root('tests', 'core', 'test_tinyfuncstr')
-      src, output = (test_path + s for s in ('.in', '.out'))
-
-      self.do_run_from_file(src, output)
+      self.do_run_in_out_file_test('tests', 'core', 'test_tinyfuncstr')
 
   def test_llvmswitch(self):
-      test_path = path_from_root('tests', 'core', 'test_llvmswitch')
-      src, output = (test_path + s for s in ('.in', '.out'))
-
-      self.do_run_from_file(src, output)
+      self.do_run_in_out_file_test('tests', 'core', 'test_llvmswitch')
 
   # By default, when user has not specified a -std flag, Emscripten should always build .cpp files using the C++03 standard,
   # i.e. as if "-std=c++03" had been passed on the command line. On Linux with Clang 3.2 this is the case, but on Windows
   # with Clang 3.2 -std=c++11 has been chosen as default, because of
   # < jrose> clb: it's deliberate, with the idea that for people who don't care about the standard, they should be using the "best" thing we can offer on that platform
   def test_cxx03_do_run(self):
-    test_path = path_from_root('tests', 'core', 'test_cxx03_do_run')
-    src, output = (test_path + s for s in ('.in', '.out'))
+    self.do_run_in_out_file_test('tests', 'core', 'test_cxx03_do_run')
 
-    self.do_run_from_file(src, output)
-
+  @no_emterpreter
   def test_bigswitch(self):
-    if self.run_name != 'default': return self.skip('TODO: issue #781')
     src = open(path_from_root('tests', 'bigswitch.cpp')).read()
     self.do_run(src, '''34962: GL_ARRAY_BUFFER (0x8892)
 26214: what?
 35040: GL_STREAM_DRAW (0x88E0)
-''', args=['34962', '26214', '35040'])
+3060: what?
+''', args=['34962', '26214', '35040', str(0xbf4)])
 
+  @no_emterpreter
   def test_biggerswitch(self):
-    num_cases = 2000 # TODO: Increase this to ~20000 range, since seeing autogenerated code that reaches that many cases.
+    num_cases = 20000
     switch_case, err = Popen([PYTHON, path_from_root('tests', 'gen_large_switchcase.py'), str(num_cases)], stdout=PIPE, stderr=PIPE).communicate()
-    self.do_run(switch_case, 'Success!')
+    self.do_run(switch_case, '''58996: 589965899658996
+59297: 592975929759297
+59598: default
+59899: 598995989959899
+Success!''')
 
+  @no_wasm_backend('no implementation of computed gotos')
   def test_indirectbr(self):
       Building.COMPILER_TEST_OPTS = filter(lambda x: x != '-g', Building.COMPILER_TEST_OPTS)
 
-      test_path = path_from_root('tests', 'core', 'test_indirectbr')
-      src, output = (test_path + s for s in ('.in', '.out'))
+      self.do_run_in_out_file_test('tests', 'core', 'test_indirectbr')
 
-      self.do_run_from_file(src, output)
-
+  @no_wasm_backend('no implementation of computed gotos')
   def test_indirectbr_many(self):
-      test_path = path_from_root('tests', 'core', 'test_indirectbr_many')
-      src, output = (test_path + s for s in ('.in', '.out'))
-
-      self.do_run_from_file(src, output)
+      self.do_run_in_out_file_test('tests', 'core', 'test_indirectbr_many')
 
   def test_pack(self):
       src = '''
@@ -2275,10 +1804,12 @@ int main() {
       self.do_run(src, '*4,3,4*\n*6,4,6*')
 
   def test_varargs(self):
-      test_path = path_from_root('tests', 'core', 'test_varargs')
-      src, output = (test_path + s for s in ('.in', '.out'))
+      self.do_run_in_out_file_test('tests', 'core', 'test_varargs')
 
-      self.do_run_from_file(src, output)
+  @no_wasm_backend('Calling varargs across function calls is undefined behavior in C,'
+                   ' and asmjs and wasm implement it differently.')
+  def test_varargs_multi(self):
+      self.do_run_in_out_file_test('tests', 'core', 'test_varargs_multi')
 
   def test_varargs_byval(self):
     return self.skip('clang cannot compile this code with that target yet')
@@ -2353,10 +1884,7 @@ The current type of b is: 9
 ''')
 
   def test_functionpointer_libfunc_varargs(self):
-    test_path = path_from_root('tests', 'core', 'test_functionpointer_libfunc_varargs')
-    src, output = (test_path + s for s in ('.in', '.out'))
-
-    self.do_run_from_file(src, output)
+    self.do_run_in_out_file_test('tests', 'core', 'test_functionpointer_libfunc_varargs')
 
   def test_structbyval(self):
       Settings.INLINING_LIMIT = 50
@@ -2468,62 +1996,9 @@ The current type of b is: 9
   def test_stdlibs(self):
       # safe heap prints a warning that messes up our output.
       Settings.SAFE_HEAP = 0
-      src = '''
-        #include <stdio.h>
-        #include <stdlib.h>
-        #include <ctype.h>
-        #include <sys/time.h>
+      self.do_run_in_out_file_test('tests', 'core', 'test_stdlibs')
 
-        void clean()
-        {
-          printf("*cleaned*\\n");
-        }
-
-        int comparer(const void *a, const void *b) {
-          int aa = *((int*)a);
-          int bb = *((int*)b);
-          return aa - bb;
-        }
-
-        int main() {
-          // timeofday
-          timeval t;
-          gettimeofday(&t, NULL);
-          printf("*%d,%d\\n", int(t.tv_sec), int(t.tv_usec)); // should not crash
-
-          // atexit
-          atexit(clean);
-
-          // qsort
-          int values[6] = { 3, 2, 5, 1, 5, 6 };
-          qsort(values, 5, sizeof(int), comparer);
-          printf("*%d,%d,%d,%d,%d,%d*\\n", values[0], values[1], values[2], values[3], values[4], values[5]);
-
-          printf("*stdin==0:%d*\\n", stdin == 0); // check that external values are at least not NULL
-          printf("*%%*\\n");
-          printf("*%.1ld*\\n", 5);
-
-          printf("*%.1f*\\n", strtod("66", NULL)); // checks dependency system, as our strtod needs _isspace etc.
-
-          printf("*%ld*\\n", strtol("10", NULL, 0));
-          printf("*%ld*\\n", strtol("0", NULL, 0));
-          printf("*%ld*\\n", strtol("-10", NULL, 0));
-          printf("*%ld*\\n", strtol("12", NULL, 16));
-
-          printf("*%lu*\\n", strtoul("10", NULL, 0));
-          printf("*%lu*\\n", strtoul("0", NULL, 0));
-          printf("*%lu*\\n", strtoul("-10", NULL, 0));
-
-          printf("*malloc(0)!=0:%d*\\n", malloc(0) != 0); // We should not fail horribly
-
-          printf("tolower_l: %c\\n", tolower_l('A', 0));
-
-          return 0;
-        }
-        '''
-
-      self.do_run(src, '*1,2,3,5,5,6*\n*stdin==0:0*\n*%*\n*5*\n*66.0*\n*10*\n*0*\n*-10*\n*18*\n*10*\n*0*\n*4294967286*\n*malloc(0)!=0:1*\ntolower_l: a\n*cleaned*')
-
+  def test_stdbool(self):
       src = r'''
         #include <stdio.h>
         #include <stdbool.h>
@@ -2540,66 +2015,39 @@ The current type of b is: 9
 
   def test_strtoll_hex(self):
     # tests strtoll for hex strings (0x...) 
-    test_path = path_from_root('tests', 'core', 'test_strtoll_hex')
-    src, output = (test_path + s for s in ('.in', '.out'))
-
-    self.do_run_from_file(src, output)
+    self.do_run_in_out_file_test('tests', 'core', 'test_strtoll_hex')
 
   def test_strtoll_dec(self):
     # tests strtoll for decimal strings (0x...) 
-    test_path = path_from_root('tests', 'core', 'test_strtoll_dec')
-    src, output = (test_path + s for s in ('.in', '.out'))
-
-    self.do_run_from_file(src, output)
+    self.do_run_in_out_file_test('tests', 'core', 'test_strtoll_dec')
 
   def test_strtoll_bin(self):
     # tests strtoll for binary strings (0x...) 
-    test_path = path_from_root('tests', 'core', 'test_strtoll_bin')
-    src, output = (test_path + s for s in ('.in', '.out'))
-
-    self.do_run_from_file(src, output)
+    self.do_run_in_out_file_test('tests', 'core', 'test_strtoll_bin')
 
   def test_strtoll_oct(self):
     # tests strtoll for decimal strings (0x...) 
-    test_path = path_from_root('tests', 'core', 'test_strtoll_oct')
-    src, output = (test_path + s for s in ('.in', '.out'))
-
-    self.do_run_from_file(src, output)
+    self.do_run_in_out_file_test('tests', 'core', 'test_strtoll_oct')
 
   def test_strtol_hex(self):
     # tests strtoll for hex strings (0x...) 
-    test_path = path_from_root('tests', 'core', 'test_strtol_hex')
-    src, output = (test_path + s for s in ('.in', '.out'))
-
-    self.do_run_from_file(src, output)
+    self.do_run_in_out_file_test('tests', 'core', 'test_strtol_hex')
 
   def test_strtol_dec(self):
     # tests strtoll for decimal strings (0x...) 
-    test_path = path_from_root('tests', 'core', 'test_strtol_dec')
-    src, output = (test_path + s for s in ('.in', '.out'))
-
-    self.do_run_from_file(src, output)
+    self.do_run_in_out_file_test('tests', 'core', 'test_strtol_dec')
 
   def test_strtol_bin(self):
     # tests strtoll for binary strings (0x...) 
-    test_path = path_from_root('tests', 'core', 'test_strtol_bin')
-    src, output = (test_path + s for s in ('.in', '.out'))
-
-    self.do_run_from_file(src, output)
+    self.do_run_in_out_file_test('tests', 'core', 'test_strtol_bin')
 
   def test_strtol_oct(self):
     # tests strtoll for decimal strings (0x...) 
-    test_path = path_from_root('tests', 'core', 'test_strtol_oct')
-    src, output = (test_path + s for s in ('.in', '.out'))
-
-    self.do_run_from_file(src, output)
+    self.do_run_in_out_file_test('tests', 'core', 'test_strtol_oct')
 
   def test_atexit(self):
     # Confirms they are called in reverse order
-    test_path = path_from_root('tests', 'core', 'test_atexit')
-    src, output = (test_path + s for s in ('.in', '.out'))
-
-    self.do_run_from_file(src, output)
+    self.do_run_in_out_file_test('tests', 'core', 'test_atexit')
 
   def test_pthread_specific(self):
     src = open(path_from_root('tests', 'pthread', 'specific.c'), 'r').read()
@@ -2610,75 +2058,49 @@ The current type of b is: 9
     src = open(path_from_root('tests', 'termios', 'test_tcgetattr.c'), 'r').read()
     self.do_run(src, 'success', force_c=True)
 
+  @no_wasm_backend('ctime relies on stackSave/stackRestore that is only generated in asmjs; '
+                   'need to implement something similar in s2wasm')
   def test_time(self):
-    src = open(path_from_root('tests', 'time', 'src.c'), 'r').read()
+    src = open(path_from_root('tests', 'time', 'src.cpp'), 'r').read()
     expected = open(path_from_root('tests', 'time', 'output.txt'), 'r').read()
     self.do_run(src, expected);
 
   def test_timeb(self):
     # Confirms they are called in reverse order
-    test_path = path_from_root('tests', 'core', 'test_timeb')
-    src, output = (test_path + s for s in ('.in', '.out'))
+    self.do_run_in_out_file_test('tests', 'core', 'test_timeb')
 
-    self.do_run_from_file(src, output)
-
+  @no_wasm_backend('ctime relies on stackSave/stackRestore that is only generated in asmjs; '
+                   'need to implement something similar in s2wasm')
   def test_time_c(self):
-    test_path = path_from_root('tests', 'core', 'test_time_c')
-    src, output = (test_path + s for s in ('.in', '.out'))
-
-    self.do_run_from_file(src, output)
+    self.do_run_in_out_file_test('tests', 'core', 'test_time_c')
 
   def test_gmtime(self):
-    test_path = path_from_root('tests', 'core', 'test_gmtime')
-    src, output = (test_path + s for s in ('.in', '.out'))
-
-    self.do_run_from_file(src, output)
+    self.do_run_in_out_file_test('tests', 'core', 'test_gmtime')
 
   def test_strptime_tm(self):
-    test_path = path_from_root('tests', 'core', 'test_strptime_tm')
-    src, output = (test_path + s for s in ('.in', '.out'))
-
-    self.do_run_from_file(src, output)
+    self.do_run_in_out_file_test('tests', 'core', 'test_strptime_tm')
 
   def test_strptime_days(self):
-    test_path = path_from_root('tests', 'core', 'test_strptime_days')
-    src, output = (test_path + s for s in ('.in', '.out'))
-
-    self.do_run_from_file(src, output)
+    self.do_run_in_out_file_test('tests', 'core', 'test_strptime_days')
 
   def test_strptime_reentrant(self):
-    test_path = path_from_root('tests', 'core', 'test_strptime_reentrant')
-    src, output = (test_path + s for s in ('.in', '.out'))
-
-    self.do_run_from_file(src, output)
+    self.do_run_in_out_file_test('tests', 'core', 'test_strptime_reentrant')
 
   def test_strftime(self):
-    test_path = path_from_root('tests', 'core', 'test_strftime')
-    src, output = (test_path + s for s in ('.in', '.out'))
+    self.do_run_in_out_file_test('tests', 'core', 'test_strftime')
 
-    self.do_run_from_file(src, output)
-
+  @no_wasm_backend("wasm backend doesn't compile intentional segfault into an abort() call. "
+                   "It also doesn't segfault.")
   def test_intentional_fault(self):
     # Some programs intentionally segfault themselves, we should compile that into a throw
-    src = r'''
-      int main () {
-        *(volatile char *)0 = 0;
-        return *(volatile char *)0;
-      }
-      '''
+    src = open(path_from_root('tests', 'core', 'test_intentional_fault.c'), 'r').read()
     self.do_run(src, 'abort()' if self.run_name != 'asm2g' else 'abort("segmentation fault')
 
   def test_trickystring(self):
-    test_path = path_from_root('tests', 'core', 'test_trickystring')
-    src, output = (test_path + s for s in ('.in', '.out'))
-
-    self.do_run_from_file(src, output)
+    self.do_run_in_out_file_test('tests', 'core', 'test_trickystring')
 
   def test_statics(self):
-      test_path = path_from_root('tests', 'core', 'test_statics')
-      src, output = (test_path + s for s in ('.in', '.out'))
-
-      self.do_run_from_file(src, output)
+      self.do_run_in_out_file_test('tests', 'core', 'test_statics')
 
   def test_copyop(self):
       # clang generated code is vulnerable to this, as it uses
@@ -2686,13 +2108,14 @@ The current type of b is: 9
       # (llvm-gcc copies items one by one). See QUANTUM_SIZE in
       # settings.js.
       test_path = path_from_root('tests', 'core', 'test_copyop')
-      src, output = (test_path + s for s in ('.in', '.out'))
+      src, output = (test_path + s for s in ('.c', '.out'))
 
       self.do_run_from_file(src, output)
 
   def test_memcpy_memcmp(self):
+      self.banned_js_engines = [V8_ENGINE] # Currently broken under V8_ENGINE but not node
       test_path = path_from_root('tests', 'core', 'test_memcpy_memcmp')
-      src, output = (test_path + s for s in ('.in', '.out'))
+      src, output = (test_path + s for s in ('.c', '.out'))
 
       def check(result, err):
         result = result.replace('\n \n', '\n') # remove extra node output
@@ -2701,66 +2124,45 @@ The current type of b is: 9
       self.do_run_from_file(src, output, output_nicerizer = check)
 
   def test_memcpy2(self):
-      test_path = path_from_root('tests', 'core', 'test_memcpy2')
-      src, output = (test_path + s for s in ('.in', '.out'))
-
-      self.do_run_from_file(src, output)
+      self.do_run_in_out_file_test('tests', 'core', 'test_memcpy2')
 
   def test_memcpy3(self):
-    test_path = path_from_root('tests', 'core', 'test_memcpy3')
-    src, output = (test_path + s for s in ('.c', '.out'))
-    self.do_run_from_file(src, output)
+    self.do_run_in_out_file_test('tests', 'core', 'test_memcpy3')
 
   def test_memset(self):
-    test_path = path_from_root('tests', 'core', 'test_memset')
-    src, output = (test_path + s for s in ('.c', '.out'))
-    self.do_run_from_file(src, output)
+    self.do_run_in_out_file_test('tests', 'core', 'test_memset')
 
   def test_getopt(self):
       test_path = path_from_root('tests', 'core', 'test_getopt')
-      src, output = (test_path + s for s in ('.in', '.out'))
+      src, output = (test_path + s for s in ('.c', '.out'))
 
       self.do_run_from_file(src, output, args=['-t', '12', '-n', 'foobar'])
 
   def test_getopt_long(self):
       test_path = path_from_root('tests', 'core', 'test_getopt_long')
-      src, output = (test_path + s for s in ('.in', '.out'))
+      src, output = (test_path + s for s in ('.c', '.out'))
 
       self.do_run_from_file(src, output, args=['--file', 'foobar', '-b'])
 
   def test_memmove(self):
-    test_path = path_from_root('tests', 'core', 'test_memmove')
-    src, output = (test_path + s for s in ('.in', '.out'))
-
-    self.do_run_from_file(src, output)
+    self.do_run_in_out_file_test('tests', 'core', 'test_memmove')
 
   def test_memmove2(self):
-    test_path = path_from_root('tests', 'core', 'test_memmove2')
-    src, output = (test_path + s for s in ('.in', '.out'))
-
-    self.do_run_from_file(src, output)
+    self.do_run_in_out_file_test('tests', 'core', 'test_memmove2')
 
   def test_memmove3(self):
-    test_path = path_from_root('tests', 'core', 'test_memmove3')
-    src, output = (test_path + s for s in ('.in', '.out'))
-
-    self.do_run_from_file(src, output)
+    self.do_run_in_out_file_test('tests', 'core', 'test_memmove3')
 
   def test_flexarray_struct(self):
-    test_path = path_from_root('tests', 'core', 'test_flexarray_struct')
-    src, output = (test_path + s for s in ('.in', '.out'))
-
-    self.do_run_from_file(src, output)
+    self.do_run_in_out_file_test('tests', 'core', 'test_flexarray_struct')
 
   def test_bsearch(self):
-    test_path = path_from_root('tests', 'core', 'test_bsearch')
-    src, output = (test_path + s for s in ('.in', '.out'))
+    self.do_run_in_out_file_test('tests', 'core', 'test_bsearch')
 
-    self.do_run_from_file(src, output)
-
+  @no_wasm_backend("wasm backend has no support for fastcomp's -emscripten-assertions flag")
   def test_stack_overflow(self):
     Settings.ASSERTIONS = 1
-    self.do_run(open(path_from_root('tests', 'core', 'stack_overflow.cpp')).read(), 'abort()')
+    self.do_run(open(path_from_root('tests', 'core', 'stack_overflow.cpp')).read(), 'Stack overflow!')
 
   def test_nestedstructs(self):
       src = '''
@@ -2855,6 +2257,8 @@ The current type of b is: 9
     self.do_run(main, 'supp: 54,2\nmain: 56\nsupp see: 543\nmain see: 76\nok.')
 
   def can_dlfcn(self):
+    if Settings.ALLOW_MEMORY_GROWTH == 1: return self.skip('no dlfcn with memory growth yet')
+    if self.is_wasm(): return self.skip('no shared modules in wasm')
     return True
 
   def prep_dlfcn_lib(self):
@@ -3110,7 +2514,6 @@ def process(filename):
     dirname = self.get_dir()
     filename = os.path.join(dirname, 'liblib.cpp')
     Settings.EXPORTED_FUNCTIONS = ['_func']
-    Settings.EXPORTED_GLOBALS = ['_global']
     self.build(lib_src, dirname, filename)
     shutil.move(filename + '.o.js', os.path.join(dirname, 'liblib.so'))
 
@@ -3170,7 +2573,6 @@ def process(filename):
       }
       '''
     Settings.EXPORTED_FUNCTIONS = ['_main']
-    Settings.EXPORTED_GLOBALS = []
     self.do_run(src, 'In func: 13*First calling main_fptr from lib.*Second calling lib_fptr from main.*parent_func called from child*parent_func called from child*Var: 42*',
                  output_nicerizer=lambda x, err: x.replace('\n', '*'),
                  post_build=self.dlfcn_post_build)
@@ -3242,10 +2644,10 @@ def process(filename):
           raise Exception('Could not find symbol table!')
       table = table[table.find('{'):table.find('}')+1]
       # ensure there aren't too many globals; we don't want unnamed_addr
-      assert table.count(',') <= 8
+      assert table.count(',') <= 23, table.count(',')
 
     test_path = path_from_root('tests', 'core', 'test_dlfcn_self')
-    src, output = (test_path + s for s in ('.in', '.out'))
+    src, output = (test_path + s for s in ('.c', '.out'))
 
     self.do_run_from_file(src, output, post_build=(None, post))
 
@@ -3485,6 +2887,7 @@ ok
     self.prep_dlfcn_lib()
     lib_src = r'''
       #include <setjmp.h>
+      #include <stdio.h>
 
       void jumpy(jmp_buf buf) {
         static int i = 0;
@@ -3612,7 +3015,9 @@ int 123
 ok
 ''', post_build=self.dlfcn_post_build)
 
-  def dylink_test(self, main, side, expected, header=None, main_emcc_args=[], force_c=False, need_reverse=True):
+  def dylink_test(self, main, side, expected, header=None, main_emcc_args=[], force_c=False, need_reverse=True, auto_load=True):
+    if not self.can_dlfcn(): return
+
     if header:
       open('header.h', 'w').write(header)
 
@@ -3644,12 +3049,13 @@ ok
       # main settings
       Settings.MAIN_MODULE = 1
       Settings.SIDE_MODULE = 0
-      open('pre.js', 'w').write('''
+      if auto_load:
+        open('pre.js', 'w').write('''
 var Module = {
   dynamicLibraries: ['liblib.so'],
 };
   ''')
-      self.emcc_args += ['--pre-js', 'pre.js'] + main_emcc_args
+        self.emcc_args += ['--pre-js', 'pre.js'] + main_emcc_args
 
       if type(main) == str:
         self.do_run(main, expected, force_c=force_c)
@@ -3737,6 +3143,107 @@ var Module = {
       int sidey(voidfunc f) { if (f) f(); return 1; }
     ''', 'hello 1\n', header='typedef void (*voidfunc)();')
 
+  def test_dylink_funcpointers2(self):
+    self.dylink_test(r'''
+      #include "header.h"
+      #include <emscripten.h>
+      void left1() { printf("left1\n"); }
+      void left2() { printf("left2\n"); }
+      voidfunc getleft1() { return left1; }
+      voidfunc getleft2() { return left2; }
+      int main(int argc, char **argv) {
+        printf("main\n");
+        EM_ASM({
+          // make the function table sizes a non-power-of-two
+          Runtime.alignFunctionTables();
+          Module['FUNCTION_TABLE_v'].push(0, 0, 0, 0, 0);
+          var newSize = Runtime.alignFunctionTables();
+          //Module.print('new size of function tables: ' + newSize);
+          // when masked, the two function pointers 1 and 2 should not happen to fall back to the right place
+          assert(((newSize+1) & 3) !== 1 || ((newSize+2) & 3) !== 2);
+          Runtime.loadDynamicLibrary('liblib.so');
+        });
+        volatilevoidfunc f;
+        f = (volatilevoidfunc)left1;
+        f();
+        f = (volatilevoidfunc)left2;
+        f();
+        f = (volatilevoidfunc)getright1();
+        f();
+        f = (volatilevoidfunc)getright2();
+        f();
+        second();
+        return 0;
+      }
+    ''', r'''
+      #include "header.h"
+      void right1() { printf("right1\n"); }
+      void right2() { printf("right2\n"); }
+      voidfunc getright1() { return right1; }
+      voidfunc getright2() { return right2; }
+      void second() {
+        printf("second\n");
+        volatilevoidfunc f;
+        f = (volatilevoidfunc)getleft1();
+        f();
+        f = (volatilevoidfunc)getleft2();
+        f();
+        f = (volatilevoidfunc)right1;
+        f();
+        f = (volatilevoidfunc)right2;
+        f();
+      }
+    ''', 'main\nleft1\nleft2\nright1\nright2\nsecond\nleft1\nleft2\nright1\nright2\n', header='''
+      #include <stdio.h>
+      typedef void (*voidfunc)();
+      typedef volatile voidfunc volatilevoidfunc;
+      voidfunc getleft1();
+      voidfunc getleft2();
+      voidfunc getright1();
+      voidfunc getright2();
+      void second();
+    ''', need_reverse=False, auto_load=False)
+
+  def test_dylink_funcpointers_wrapper(self):
+    self.dylink_test(r'''
+      #include <stdio.h>
+      #include "header.h"
+      int main(int argc, char **argv) {
+        volatile charfunc f = emscripten_run_script;
+        f("Module.print('one')");
+        f = get();
+        f("Module.print('two')");
+        return 0;
+      }
+    ''', '''
+      #include "header.h"
+      charfunc get() {
+        return emscripten_run_script;
+      }
+    ''', 'one\ntwo\n', header='''
+      #include <emscripten.h>
+      typedef void (*charfunc)(const char*);
+      extern charfunc get();
+    ''')
+
+  def test_dylink_funcpointers_float(self):
+    self.dylink_test(r'''
+      #include <stdio.h>
+      #include "header.h"
+      int sidey(floatfunc f);
+      float areturn0(float f) { printf("hello 0: %f\n", f); return 0; }
+      float areturn1(float f) { printf("hello 1: %f\n", f); return 1; }
+      float areturn2(float f) { printf("hello 2: %f\n", f); return 2; }
+      int main(int argc, char **argv) {
+        volatile floatfunc table[3] = { areturn0, areturn1, areturn2 };
+        printf("got: %d\n", (int)table[sidey(NULL)](12.34));
+        return 0;
+      }
+    ''', '''
+      #include "header.h"
+      int sidey(floatfunc f) { if (f) f(56.78); return 1; }
+    ''', 'hello 1: 12.340000\ngot: 1\n', header='typedef float (*floatfunc)(float);')
+
   def test_dylink_global_init(self):
     self.dylink_test(r'''
       #include <stdio.h>
@@ -3752,6 +3259,7 @@ var Module = {
     ''', 'a new Class\n')
 
   def test_dylink_global_inits(self):
+    if not self.can_dlfcn(): return
     def test():
       self.dylink_test(header=r'''
         #include <stdio.h>
@@ -3783,7 +3291,7 @@ var Module = {
       #include <stdint.h>
       extern int64_t sidey();
       int main() {
-        printf("other says %lld.", sidey());
+        printf("other says %llx.\\n", sidey());
         return 0;
       }
     ''', '''
@@ -3793,9 +3301,38 @@ var Module = {
         x = x * x * x * x;
         x += x % 17;
         x += (x * (1 << 30));
+        x -= 96;
+        x = (x + 1000) / ((x % 5) + 1);
+        volatile uint64_t y = x / 2;
+        x = y / 3;
+        y = y * y * y * y;
+        y += y % 17;
+        y += (y * (1 << 30));
+        y -= 121;
+        y = (y + 1000) / ((y % 5) + 1);
+        x += y;
         return x;
       }
-    ''', 'other says 15724949027125.')
+    ''', 'other says 175a1ddee82b8c31.')
+
+  def test_dylink_i64_b(self):
+    self.dylink_test('''
+      #include <stdio.h>
+      #include <stdint.h>
+      extern int64_t sidey();
+      int main() {
+        printf("other says %lld.", sidey());
+        return 0;
+      }
+    ''', '''
+      #include <stdint.h>
+      int64_t sidey() {
+        volatile int64_t x = 0x12345678abcdef12LL;
+        x += x % 17;
+        x = 18 - x;
+        return x;
+      }
+    ''', 'other says -1311768467750121224.')
 
   def test_dylink_class(self):
     self.dylink_test(header=r'''
@@ -3925,33 +3462,55 @@ var Module = {
       }
     ''', expected=['main: jslib_x is 148.\nside: jslib_x is 148.\n'], main_emcc_args=['--js-library', 'lib.js'])
 
-  def test_dylink_syslibs(self): # one module uses libcextra, need to force its inclusion when it isn't the main
-    def test(syslibs, expect_pass=True):
+  def test_dylink_many_postSets(self):
+    NUM = 1234
+    self.dylink_test(header=r'''
+      #include <stdio.h>
+      typedef void (*voidfunc)();
+      static void simple() {
+        printf("simple.\n");
+      }
+      static volatile voidfunc funcs[''' + str(NUM) + '] = { ' + ','.join(['simple'] * NUM) + r''' };
+      static void test() {
+        volatile int i = ''' + str(NUM-1) + r''';
+        funcs[i]();
+        i = 0;
+        funcs[i]();
+      }
+      extern void more();
+    ''', main=r'''
+      #include "header.h"
+      int main() {
+        test();
+        more();
+        return 0;
+      }
+    ''', side=r'''
+      #include "header.h"
+      void more() {
+        test();
+      }
+    ''', expected=['simple.\nsimple.\nsimple.\nsimple.\n'])
+
+  def test_dylink_syslibs(self): # one module uses libcxx, need to force its inclusion when it isn't the main
+    if not self.can_dlfcn(): return
+
+    def test(syslibs, expect_pass=True, need_reverse=True):
       print 'syslibs', syslibs, Settings.ASSERTIONS
       passed = True
       try:
         os.environ['EMCC_FORCE_STDLIBS'] = syslibs
-        self.dylink_test(header=r'''
-          #include <string.h>
-          int side();
-        ''', main=r'''
-          #include <stdio.h>
-          #include <wchar.h>
-          #include "header.h"
+        self.dylink_test(main=r'''
+          void side();
           int main() {
-            printf("|%d|\n", side());
-            wprintf (L"Characters: %lc %lc\n", L'a', 65);
+            side();
             return 0;
           }
         ''', side=r'''
-          #include <stdlib.h>
-          #include <malloc.h>
-          #include "header.h"
-          int side() {
-            struct mallinfo m = mallinfo();
-            return m.arena > 1;
-          }
-        ''', expected=['|1|\nCharacters: a A\n'])
+          #include <iostream>
+          void side() { std::cout << "cout hello from side"; }
+        ''', expected=['cout hello from side\n'],
+             need_reverse=need_reverse)
       except Exception, e:
         if expect_pass: raise e
         print '(seeing expected fail)'
@@ -3963,17 +3522,17 @@ var Module = {
           self.assertNotContained(assertion, str(e))
       finally:
         del os.environ['EMCC_FORCE_STDLIBS']
-      assert passed == expect_pass
+      assert passed == expect_pass, ['saw', passed, 'but expected', expect_pass]
 
-    test('libc,libcextra')
+    test('libcxx')
     test('1')
     if 'ASSERTIONS=1' not in self.emcc_args:
       Settings.ASSERTIONS = 0
-      test('', expect_pass=False)
+      test('', expect_pass=False, need_reverse=False)
     else:
       print '(skip ASSERTIONS == 0 part)'
     Settings.ASSERTIONS = 1
-    test('', expect_pass=False)
+    test('', expect_pass=False, need_reverse=False)
 
   def test_dylink_iostream(self):
     try:
@@ -4044,6 +3603,8 @@ var Module = {
     ''', expected=['starting main\nBase\nDerived\nOK'])
 
   def test_dylink_hyper_dupe(self):
+    if not self.can_dlfcn(): return
+
     Settings.TOTAL_MEMORY = 64*1024*1024
 
     if Settings.ASSERTIONS: self.emcc_args += ['-s', 'ASSERTIONS=2']
@@ -4238,6 +3799,7 @@ Have even and odd!
 '''
     self.do_run(src, expected)
 
+  @no_wasm_backend('printf is incorrectly handling float values')
   def test_strtod(self):
     src = r'''
       #include <stdio.h>
@@ -4313,10 +3875,7 @@ Have even and odd!
     self.do_run(src.replace('strtod', 'strtold'), re.sub(r'\n\s+', '\n', expected)) # XXX add real support for long double
 
   def test_strtok(self):
-    test_path = path_from_root('tests', 'core', 'test_strtok')
-    src, output = (test_path + s for s in ('.in', '.out'))
-
-    self.do_run_from_file(src, output)
+    self.do_run_in_out_file_test('tests', 'core', 'test_strtok')
 
   def test_parseInt(self):
     src = open(path_from_root('tests', 'parseInt', 'src.c'), 'r').read()
@@ -4324,78 +3883,56 @@ Have even and odd!
     self.do_run(src, expected)
 
   def test_transtrcase(self):
-    test_path = path_from_root('tests', 'core', 'test_transtrcase')
-    src, output = (test_path + s for s in ('.in', '.out'))
-
-    self.do_run_from_file(src, output)
+    self.do_run_in_out_file_test('tests', 'core', 'test_transtrcase')
 
   def test_printf(self):
     self.banned_js_engines = [NODE_JS, V8_ENGINE] # SpiderMonkey and V8 do different things to float64 typed arrays, un-NaNing, etc.
     src = open(path_from_root('tests', 'printf', 'test.c'), 'r').read()
-    expected = [open(path_from_root('tests', 'printf', 'output.txt'), 'r').read(),
-                open(path_from_root('tests', 'printf', 'output_i64_1.txt'), 'r').read()]
+    expected = open(path_from_root('tests', 'printf', 'output.txt'), 'r').read()
     self.do_run(src, expected)
 
   def test_printf_2(self):
-    test_path = path_from_root('tests', 'core', 'test_printf_2')
-    src, output = (test_path + s for s in ('.in', '.out'))
+    self.do_run_in_out_file_test('tests', 'core', 'test_printf_2')
 
-    self.do_run_from_file(src, output)
+  def test_printf_float(self):
+    self.do_run_in_out_file_test('tests', 'printf', 'test_float')
+
+  def test_printf_octal(self):
+    self.do_run_in_out_file_test('tests', 'printf', 'test_octal')
 
   def test_vprintf(self):
-    test_path = path_from_root('tests', 'core', 'test_vprintf')
-    src, output = (test_path + s for s in ('.in', '.out'))
-
-    self.do_run_from_file(src, output)
+    self.do_run_in_out_file_test('tests', 'core', 'test_vprintf')
 
   def test_vsnprintf(self):
-    test_path = path_from_root('tests', 'core', 'test_vsnprintf')
-    src, output = (test_path + s for s in ('.in', '.out'))
-
-    self.do_run_from_file(src, output)
+    self.do_run_in_out_file_test('tests', 'core', 'test_vsnprintf')
 
   def test_printf_more(self):
-    test_path = path_from_root('tests', 'core', 'test_printf_more')
-    src, output = (test_path + s for s in ('.in', '.out'))
-
-    self.do_run_from_file(src, output)
+    self.do_run_in_out_file_test('tests', 'core', 'test_printf_more')
 
   def test_perrar(self):
-    test_path = path_from_root('tests', 'core', 'test_perrar')
-    src, output = (test_path + s for s in ('.in', '.out'))
-
-    self.do_run_from_file(src, output)
+    self.do_run_in_out_file_test('tests', 'core', 'test_perrar')
 
   def test_atoX(self):
-    test_path = path_from_root('tests', 'core', 'test_atoX')
-    src, output = (test_path + s for s in ('.in', '.out'))
-
-    self.do_run_from_file(src, output)
+    self.do_run_in_out_file_test('tests', 'core', 'test_atoX')
 
   def test_strstr(self):
-    test_path = path_from_root('tests', 'core', 'test_strstr')
-    src, output = (test_path + s for s in ('.in', '.out'))
-
-    self.do_run_from_file(src, output)
+    self.do_run_in_out_file_test('tests', 'core', 'test_strstr')
 
   def test_fnmatch(self):
     # Run one test without assertions, for additional coverage
-    assert 'asm2m' in test_modes
+    #assert 'asm2m' in test_modes
     if self.run_name == 'asm2m':
       i = self.emcc_args.index('ASSERTIONS=1')
       assert i > 0 and self.emcc_args[i-1] == '-s'
       self.emcc_args[i] = 'ASSERTIONS=0'
       print 'flip assertions off'
-    test_path = path_from_root('tests', 'core', 'fnmatch')
-    src, output = (test_path + s for s in ('.c', '.out'))
-    self.do_run_from_file(src, output)
+    self.do_run_in_out_file_test('tests', 'core', 'fnmatch')
 
+  @no_wasm_backend('sscanf seems to be misreading float values')
   def test_sscanf(self):
-    test_path = path_from_root('tests', 'core', 'test_sscanf')
-    src, output = (test_path + s for s in ('.in', '.out'))
+    self.do_run_in_out_file_test('tests', 'core', 'test_sscanf')
 
-    self.do_run_from_file(src, output)
-
+  @no_wasm_backend('sscanf seems to be misreading float values')
   def test_sscanf_2(self):
     # doubles
     for ftype in ['float', 'double']:
@@ -4440,8 +3977,8 @@ Have even and odd!
         '''
       if ftype == 'float':
         self.do_run(src.replace('%lf', '%f').replace('double', 'float'), '''Pass: 1.234568 1.234568
-Pass: 123456.789063 123456.789063
-Pass: 123456.789063 123456.789063
+Pass: 123456.789062 123456.789062
+Pass: 123456.789062 123456.789062
 Pass: 0.000012 0.000012
 Pass: 0.000012 0.000012''')
       else:
@@ -4452,71 +3989,41 @@ Pass: 0.000012 0.000012
 Pass: 0.000012 0.000012''')
 
   def test_sscanf_n(self):
-    test_path = path_from_root('tests', 'core', 'test_sscanf_n')
-    src, output = (test_path + s for s in ('.in', '.out'))
-
-    self.do_run_from_file(src, output)
+    self.do_run_in_out_file_test('tests', 'core', 'test_sscanf_n')
 
   def test_sscanf_whitespace(self):
-    test_path = path_from_root('tests', 'core', 'test_sscanf_whitespace')
-    src, output = (test_path + s for s in ('.in', '.out'))
-
-    self.do_run_from_file(src, output)
+    self.do_run_in_out_file_test('tests', 'core', 'test_sscanf_whitespace')
 
   def test_sscanf_other_whitespace(self):
     Settings.SAFE_HEAP = 0 # use i16s in printf
 
-    test_path = path_from_root('tests', 'core', 'test_sscanf_other_whitespace')
-    src, output = (test_path + s for s in ('.in', '.out'))
-
-    self.do_run_from_file(src, output)
+    self.do_run_in_out_file_test('tests', 'core', 'test_sscanf_other_whitespace')
 
   def test_sscanf_3(self):
-    test_path = path_from_root('tests', 'core', 'test_sscanf_3')
-    src, output = (test_path + s for s in ('.in', '.out'))
-
-    self.do_run_from_file(src, output)
+    self.do_run_in_out_file_test('tests', 'core', 'test_sscanf_3')
 
   def test_sscanf_4(self):
-    test_path = path_from_root('tests', 'core', 'test_sscanf_4')
-    src, output = (test_path + s for s in ('.in', '.out'))
-
-    self.do_run_from_file(src, output)
+    self.do_run_in_out_file_test('tests', 'core', 'test_sscanf_4')
 
   def test_sscanf_5(self):
-    test_path = path_from_root('tests', 'core', 'test_sscanf_5')
-    src, output = (test_path + s for s in ('.in', '.out'))
-
-    self.do_run_from_file(src, output)
+    self.do_run_in_out_file_test('tests', 'core', 'test_sscanf_5')
 
   def test_sscanf_6(self):
-    test_path = path_from_root('tests', 'core', 'test_sscanf_6')
-    src, output = (test_path + s for s in ('.in', '.out'))
-    self.do_run_from_file(src, output)
+    self.do_run_in_out_file_test('tests', 'core', 'test_sscanf_6')
 
   def test_sscanf_skip(self):
-    test_path = path_from_root('tests', 'core', 'test_sscanf_skip')
-    src, output = (test_path + s for s in ('.in', '.out'))
+    self.do_run_in_out_file_test('tests', 'core', 'test_sscanf_skip')
 
-    self.do_run_from_file(src, output)
-
+  @no_wasm_backend('sscanf seems to be misreading float values')
   def test_sscanf_caps(self):
-    test_path = path_from_root('tests', 'core', 'test_sscanf_caps')
-    src, output = (test_path + s for s in ('.in', '.out'))
-
-    self.do_run_from_file(src, output)
+    self.do_run_in_out_file_test('tests', 'core', 'test_sscanf_caps')
 
   def test_sscanf_hex(self):
-    test_path = path_from_root('tests', 'core', 'test_sscanf_hex')
-    src, output = (test_path + s for s in ('.in', '.out'))
+    self.do_run_in_out_file_test('tests', 'core', 'test_sscanf_hex')
 
-    self.do_run_from_file(src, output)
-
+  @no_wasm_backend('sscanf seems to be misreading float values')
   def test_sscanf_float(self):
-    test_path = path_from_root('tests', 'core', 'test_sscanf_float')
-    src, output = (test_path + s for s in ('.in', '.out'))
-
-    self.do_run_from_file(src, output)
+    self.do_run_in_out_file_test('tests', 'core', 'test_sscanf_float')
 
   def test_langinfo(self):
     src = open(path_from_root('tests', 'langinfo', 'test.c'), 'r').read()
@@ -4525,9 +4032,14 @@ Pass: 0.000012 0.000012''')
 
   def test_files(self):
     self.banned_js_engines = [SPIDERMONKEY_ENGINE] # closure can generate variables called 'gc', which pick up js shell stuff
-    if '-O2' in self.emcc_args:
+    if '-O2' in self.emcc_args and not self.is_wasm():
       self.emcc_args += ['--closure', '1'] # Use closure here, to test we don't break FS stuff
       self.emcc_args = filter(lambda x: x != '-g', self.emcc_args) # ensure we test --closure 1 --memory-init-file 1 (-g would disable closure)
+    elif '-O3' in self.emcc_args and not self.is_wasm():
+      print 'closure 2'
+      self.emcc_args += ['--closure', '2'] # Use closure 2 here for some additional coverage
+
+    print 'base', self.emcc_args
 
     post = '''
 def process(filename):
@@ -4537,7 +4049,7 @@ def process(filename):
       'preRun': function() {
         FS.createLazyFile('/', 'test.file', 'test.file', true, false);
         // Test FS_* exporting
-        Module['FS_createDataFile']('/', 'somefile.binary', [100, 200, 50, 25, 10, 77, 123], true, false);  // 200 becomes -56, since signed chars are used in memory
+        Module['FS_createDataFile']('/', 'somefile.binary', [100, 200, 50, 25, 10, 77, 123], true, false, false);  // 200 becomes -56, since signed chars are used in memory
         var test_files_input = 'hi there!';
         var test_files_input_index = 0;
         FS.init(function() {
@@ -4549,20 +4061,25 @@ def process(filename):
   open(filename, 'w').write(src)
 '''
     other = open(os.path.join(self.get_dir(), 'test.file'), 'w')
-    other.write('some data');
+    other.write('some data')
     other.close()
 
     src = open(path_from_root('tests', 'files.cpp'), 'r').read()
 
     mem_file = 'src.cpp.o.js.mem'
     orig_args = self.emcc_args
-    for mode in [[], ['-s', 'MEMFS_APPEND_TO_TYPED_ARRAYS=1']]:
+    for mode in [[], ['-s', 'MEMFS_APPEND_TO_TYPED_ARRAYS=1'], ['-s', 'SYSCALL_DEBUG=1']]:
+      print mode
       self.emcc_args = orig_args + mode
       try_delete(mem_file)
-      self.do_run(src, ('size: 7\ndata: 100,-56,50,25,10,77,123\nloop: 100 -56 50 25 10 77 123 \ninput:hi there!\ntexto\n$\n5 : 10,30,20,11,88\nother=some data.\nseeked=me da.\nseeked=ata.\nseeked=ta.\nfscanfed: 10 - hello\n5 bytes to dev/null: 5\nok.\n \ntexte\n', 'size: 7\ndata: 100,-56,50,25,10,77,123\nloop: 100 -56 50 25 10 77 123 \ninput:hi there!\ntexto\ntexte\n$\n5 : 10,30,20,11,88\nother=some data.\nseeked=me da.\nseeked=ata.\nseeked=ta.\nfscanfed: 10 - hello\n5 bytes to dev/null: 5\nok.\n'),
-                  post_build=post, extra_emscripten_args=['-H', 'libc/fcntl.h'])
+
+      def clean(out, err):
+        return '\n'.join(filter(lambda line: 'binaryen' not in line, (out + err).split('\n')))
+
+      self.do_run(src, map(lambda x: x if 'SYSCALL_DEBUG=1' not in mode else ('syscall! 146,SYS_writev' if self.run_name == 'default' else 'syscall! 146'), ('size: 7\ndata: 100,-56,50,25,10,77,123\nloop: 100 -56 50 25 10 77 123 \ninput:hi there!\ntexto\n$\n5 : 10,30,20,11,88\nother=some data.\nseeked=me da.\nseeked=ata.\nseeked=ta.\nfscanfed: 10 - hello\n5 bytes to dev/null: 5\nok.\ntexte\n', 'size: 7\ndata: 100,-56,50,25,10,77,123\nloop: 100 -56 50 25 10 77 123 \ninput:hi there!\ntexto\ntexte\n$\n5 : 10,30,20,11,88\nother=some data.\nseeked=me da.\nseeked=ata.\nseeked=ta.\nfscanfed: 10 - hello\n5 bytes to dev/null: 5\nok.\n')),
+                  post_build=post, extra_emscripten_args=['-H', 'libc/fcntl.h'], output_nicerizer=clean)
       if self.uses_memory_init_file():
-        assert os.path.exists(mem_file)
+        assert os.path.exists(mem_file), 'File %s does not exist' % mem_file
 
   def test_files_m(self):
     # Test for Module.stdin etc.
@@ -4592,16 +4109,21 @@ def process(filename):
       }
       '''
     def clean(out, err):
-      return '\n'.join(filter(lambda line: 'warning' not in line, (out + err).split('\n')))
+      return '\n'.join(filter(lambda line: 'warning' not in line and 'binaryen' not in line, (out + err).split('\n')))
     self.do_run(src, ('got: 35\ngot: 45\ngot: 25\ngot: 15\n \nisatty? 0,0,1\n', 'got: 35\ngot: 45\ngot: 25\ngot: 15\nisatty? 0,0,1\n', 'isatty? 0,0,1\ngot: 35\ngot: 45\ngot: 25\ngot: 15\n'), post_build=post, output_nicerizer=clean)
 
   def test_mount(self):
+    Settings.FORCE_FILESYSTEM = 1
     src = open(path_from_root('tests', 'fs', 'test_mount.c'), 'r').read()
     self.do_run(src, 'success', force_c=True)
 
+  def test_getdents64(self):
+    src = open(path_from_root('tests', 'fs', 'test_getdents64.cpp'), 'r').read()
+    self.do_run(src, '..')
+
   def test_fwrite_0(self):
     test_path = path_from_root('tests', 'core', 'test_fwrite_0')
-    src, output = (test_path + s for s in ('.in', '.out'))
+    src, output = (test_path + s for s in ('.c', '.out'))
 
     orig_args = self.emcc_args
     for mode in [[], ['-s', 'MEMFS_APPEND_TO_TYPED_ARRAYS=1']]:
@@ -4609,12 +4131,15 @@ def process(filename):
       self.do_run_from_file(src, output)
 
   def test_fgetc_ungetc(self):
+    logging.warning('TODO: update this test once the musl ungetc-on-EOF-stream bug is fixed upstream and reaches us')
+    Settings.SYSCALL_DEBUG = 1
     self.clear()
     orig_compiler_opts = Building.COMPILER_TEST_OPTS[:]
     for fs in ['MEMFS', 'NODEFS']:
-        src = open(path_from_root('tests', 'stdio', 'test_fgetc_ungetc.c'), 'r').read()
-        Building.COMPILER_TEST_OPTS = orig_compiler_opts + ['-D' + fs]
-        self.do_run(src, 'success', force_c=True, js_engines=[NODE_JS])
+      print fs
+      src = open(path_from_root('tests', 'stdio', 'test_fgetc_ungetc.c'), 'r').read()
+      Building.COMPILER_TEST_OPTS = orig_compiler_opts + ['-D' + fs]
+      self.do_run(src, 'success', force_c=True, js_engines=[NODE_JS])
 
   def test_fgetc_unsigned(self):
     src = r'''
@@ -4635,7 +4160,7 @@ def process(filename):
       char buf[32];
       int main()
       {
-        char *r = "SUCCESS";
+        const char *r = "SUCCESS";
         FILE *f = fopen("eol.txt", "r");
         while (fgets(buf, 32, f) != NULL) {
           if (buf[0] == '\0') {
@@ -4652,6 +4177,7 @@ def process(filename):
     self.emcc_args += ['--embed-file', 'eol.txt']
     self.do_run(src, 'SUCCESS\n')
 
+  @no_wasm_backend('printf is incorrectly handling float values')
   def test_fscanf(self):
     open(os.path.join(self.get_dir(), 'three_numbers.txt'), 'w').write('''-1 0.1 -.1''')
     src = r'''
@@ -4712,9 +4238,7 @@ main( int argv, char ** argc ) {
       {
           FILE* fp = fopen("empty.txt", "r");
           if (fp) {
-              printf("%d\n", fp);
               printf("%d\n", fileno(fp));
-              printf("%d\n", fileno((FILE*)42));  // nonexistent stream
           } else {
               printf("failed to open empty.txt\n");
           }
@@ -4722,15 +4246,16 @@ main( int argv, char ** argc ) {
       }
     '''
     self.emcc_args += ['--embed-file', 'empty.txt']
-    self.do_run(src, '4\n3\n-1\n')
+    self.do_run(src, '3\n')
 
   def test_readdir(self):
     self.banned_js_engines = [V8_ENGINE] # stderr printing limitations in v8
     src = open(path_from_root('tests', 'dirent', 'test_readdir.c'), 'r').read()
     self.do_run(src, '''SIGILL: Illegal instruction
 success
-n: 7
+n: 8
 name: tmp
+name: proc
 name: nocanread
 name: home
 name: foobar
@@ -4760,7 +4285,7 @@ name: .
 def process(filename):
   src = open(filename, 'r').read().replace(
     '// {{PRE_RUN_ADDITIONS}}',
-    "FS.createDataFile('/', 'test', 'abcdef', true, true);"
+    "FS.createDataFile('/', 'test', 'abcdef', true, true, false);"
   )
   open(filename, 'w').write(src)
 '''
@@ -4778,7 +4303,7 @@ def process(filename):
 def process(filename):
   src = open(filename, 'r').read().replace(
     '// {{PRE_RUN_ADDITIONS}}',
-    "FS.createDataFile('/', 'test', 'abcdef', true, true);"
+    "FS.createDataFile('/', 'test', 'abcdef', true, true, false);"
   )
   open(filename, 'w').write(src)
 '''
@@ -4795,28 +4320,22 @@ def process(filename):
       var dummy_device = FS.makedev(64, 0);
       FS.registerDevice(dummy_device, {});
 
-      FS.createDataFile('/', 'file', 'abcdef', true, true);
+      FS.createDataFile('/', 'file', 'abcdef', true, true, false);
       FS.mkdev('/device', dummy_device);
     \'\'\'
   )
   open(filename, 'w').write(src)
 '''
     test_path = path_from_root('tests', 'core', 'test_poll')
-    src, output = (test_path + s for s in ('.in', '.out'))
+    src, output = (test_path + s for s in ('.c', '.out'))
 
     self.do_run_from_file(src, output, post_build=add_pre_run, extra_emscripten_args=['-H', 'libc/fcntl.h,poll.h'])
 
   def test_statvfs(self):
-    test_path = path_from_root('tests', 'core', 'test_statvfs')
-    src, output = (test_path + s for s in ('.in', '.out'))
-
-    self.do_run_from_file(src, output)
+    self.do_run_in_out_file_test('tests', 'core', 'test_statvfs')
 
   def test_libgen(self):
-    test_path = path_from_root('tests', 'core', 'test_libgen')
-    src, output = (test_path + s for s in ('.in', '.out'))
-
-    self.do_run_from_file(src, output)
+    self.do_run_in_out_file_test('tests', 'core', 'test_libgen')
 
   def test_utime(self):
     src = open(path_from_root('tests', 'utime', 'test_utime.c'), 'r').read()
@@ -4826,19 +4345,31 @@ def process(filename):
     self.banned_js_engines = [SPIDERMONKEY_ENGINE] # only node handles utf well
     Settings.EXPORTED_FUNCTIONS = ['_main', '_malloc']
 
-    test_path = path_from_root('tests', 'core', 'test_utf')
-    src, output = (test_path + s for s in ('.in', '.out'))
+    self.do_run_in_out_file_test('tests', 'core', 'test_utf')
 
-    self.do_run_from_file(src, output)
-
+  @no_wasm_backend('requires EM_ASM args support in wasm backend')
   def test_utf32(self):
+    Settings.EXTRA_EXPORTED_RUNTIME_METHODS = ['UTF32ToString', 'stringToUTF32', 'lengthBytesUTF32']
     self.do_run(open(path_from_root('tests', 'utf32.cpp')).read(), 'OK.')
     self.do_run(open(path_from_root('tests', 'utf32.cpp')).read(), 'OK.', args=['-fshort-wchar'])
 
+  @no_wasm_backend('requires EM_ASM args support in wasm backend')
   def test_utf8(self):
     Building.COMPILER_TEST_OPTS += ['-std=c++11']
     self.do_run(open(path_from_root('tests', 'utf8.cpp')).read(), 'OK.')
 
+  @no_wasm_backend('requires EM_ASM args support in wasm backend')
+  def test_utf8_textdecoder(self):
+    Building.COMPILER_TEST_OPTS += ['--embed-file', path_from_root('tests/utf8_corpus.txt')+ '@/utf8_corpus.txt']
+    self.do_run(open(path_from_root('tests', 'benchmark_utf8.cpp')).read(), 'OK.')
+
+  @no_wasm_backend('requires EM_ASM args support in wasm backend')
+  def test_utf16_textdecoder(self):
+    Settings.EXTRA_EXPORTED_RUNTIME_METHODS = ['UTF16ToString', 'stringToUTF16', 'lengthBytesUTF16']
+    Building.COMPILER_TEST_OPTS += ['--embed-file', path_from_root('tests/utf16_corpus.txt')+ '@/utf16_corpus.txt']
+    self.do_run(open(path_from_root('tests', 'benchmark_utf16.cpp')).read(), 'OK.')
+
+  @no_wasm_backend('printf is incorrectly handling float values')
   def test_wprintf(self):
     test_path = path_from_root('tests', 'core', 'test_wprintf')
     src, output = (test_path + s for s in ('.c', '.out'))
@@ -4848,27 +4379,23 @@ def process(filename):
       self.do_run_from_file(src, output)
 
   def test_direct_string_constant_usage(self):
-    test_path = path_from_root('tests', 'core', 'test_direct_string_constant_usage')
-    src, output = (test_path + s for s in ('.in', '.out'))
-
-    self.do_run_from_file(src, output)
+    self.do_run_in_out_file_test('tests', 'core', 'test_direct_string_constant_usage')
 
   def test_std_cout_new(self):
-    test_path = path_from_root('tests', 'core', 'test_std_cout_new')
-    src, output = (test_path + s for s in ('.in', '.out'))
-
-    self.do_run_from_file(src, output)
+    self.do_run_in_out_file_test('tests', 'core', 'test_std_cout_new')
 
   def test_istream(self):
     test_path = path_from_root('tests', 'core', 'test_istream')
-    src, output = (test_path + s for s in ('.in', '.out'))
+    src, output = (test_path + s for s in ('.c', '.out'))
 
     for linkable in [0]:#, 1]:
       print linkable
       Settings.LINKABLE = linkable # regression check for issue #273
       self.do_run_from_file(src, output)
 
+  @no_wasm
   def test_fs_base(self):
+    if self.is_wasm(): return self.skip('wasm libc overlaps js lib, so no INCLUDE_FULL_LIBRARY')
     Settings.INCLUDE_FULL_LIBRARY = 1
     try:
       addJS = '''
@@ -4886,7 +4413,15 @@ def process(filename):
       Settings.INCLUDE_FULL_LIBRARY = 0
 
   def test_fs_nodefs_rw(self):
+    Settings.SYSCALL_DEBUG = 1
     src = open(path_from_root('tests', 'fs', 'test_nodefs_rw.c'), 'r').read()
+    self.do_run(src, 'success', force_c=True, js_engines=[NODE_JS])
+    print 'closure'
+    self.emcc_args += ['--closure', '1']
+    self.do_run(src, 'success', force_c=True, js_engines=[NODE_JS])
+
+  def test_fs_nodefs_cloexec(self):
+    src = open(path_from_root('tests', 'fs', 'test_nodefs_cloexec.c'), 'r').read()
     self.do_run(src, 'success', force_c=True, js_engines=[NODE_JS])
 
   def test_fs_trackingdelegate(self):
@@ -4898,6 +4433,12 @@ def process(filename):
     self.emcc_args += ['-s', 'DISABLE_EXCEPTION_CATCHING=1'] # see issue 2334
     src = path_from_root('tests', 'fs', 'test_writeFile.cc')
     out = path_from_root('tests', 'fs', 'test_writeFile.out')
+    self.do_run_from_file(src, out)
+
+  def test_fs_write(self):
+    self.emcc_args = ['-s', 'MEMFS_APPEND_TO_TYPED_ARRAYS=1']
+    src = path_from_root('tests', 'fs', 'test_write.cpp')
+    out = path_from_root('tests', 'fs', 'test_write.out')
     self.do_run_from_file(src, out)
 
   def test_fs_emptyPath(self):
@@ -4989,6 +4530,8 @@ def process(filename):
     for fs in ['MEMFS', 'NODEFS']:
       src = open(path_from_root('tests', 'unistd', 'unlink.c'), 'r').read()
       Building.COMPILER_TEST_OPTS = orig_compiler_opts + ['-D' + fs]
+      # symlinks on node.js on Windows require administrative privileges, so skip testing those bits on that combination.
+      if WINDOWS and fs == 'NODEFS': Building.COMPILER_TEST_OPTS += ['-DNO_SYMLINK=1']
       self.do_run(src, 'success', force_c=True, js_engines=[NODE_JS])
 
   def test_unistd_links(self):
@@ -5056,9 +4599,7 @@ def process(filename):
       print '(no v8, skipping no-monotonic case)'
 
   def test_uname(self):
-    test_path = path_from_root('tests', 'core', 'test_uname')
-    src, output = (test_path + s for s in ('.in', '.out'))
-    self.do_run_from_file(src, output)
+    self.do_run_in_out_file_test('tests', 'core', 'test_uname')
 
   def test_env(self):
     src = open(path_from_root('tests', 'env', 'src.c'), 'r').read()
@@ -5082,16 +4623,10 @@ def process(filename):
     self.do_run(src, expected)
 
   def test_getloadavg(self):
-    test_path = path_from_root('tests', 'core', 'test_getloadavg')
-    src, output = (test_path + s for s in ('.in', '.out'))
-
-    self.do_run_from_file(src, output)
+    self.do_run_in_out_file_test('tests', 'core', 'test_getloadavg')
 
   def test_nl_types(self):
-    test_path = path_from_root('tests', 'core', 'test_nl_types')
-    src, output = (test_path + s for s in ('.in', '.out'))
-
-    self.do_run_from_file(src, output)
+    self.do_run_in_out_file_test('tests', 'core', 'test_nl_types')
 
   def test_799(self):
     src = open(path_from_root('tests', '799.cpp'), 'r').read()
@@ -5106,31 +4641,25 @@ PORT: 3979
     self.do_run(src, expected)
 
   def test_strcasecmp(self):
-    test_path = path_from_root('tests', 'core', 'test_strcasecmp')
-    src, output = (test_path + s for s in ('.in', '.out'))
-
-    self.do_run_from_file(src, output)
+    self.do_run_in_out_file_test('tests', 'core', 'test_strcasecmp')
 
   def test_atomic(self):
-    test_path = path_from_root('tests', 'core', 'test_atomic')
-    src, output = (test_path + s for s in ('.in', '.out'))
-    self.do_run_from_file(src, output)
+    self.do_run_in_out_file_test('tests', 'core', 'test_atomic')
 
+  @no_wasm_backend()
   def test_atomic_cxx(self):
     test_path = path_from_root('tests', 'core', 'test_atomic_cxx')
     src, output = (test_path + s for s in ('.cpp', '.txt'))
     Building.COMPILER_TEST_OPTS += ['-std=c++11']
     self.do_run_from_file(src, output)
 
-    print 'main module'
-    Settings.MAIN_MODULE = 1
-    self.do_run_from_file(src, output)
+    if Settings.ALLOW_MEMORY_GROWTH == 0 and not self.is_wasm():
+      print 'main module'
+      Settings.MAIN_MODULE = 1
+      self.do_run_from_file(src, output)
 
   def test_phiundef(self):
-    test_path = path_from_root('tests', 'core', 'test_phiundef')
-    src, output = (test_path + s for s in ('.in', '.out'))
-
-    self.do_run_from_file(src, output)
+    self.do_run_in_out_file_test('tests', 'core', 'test_phiundef')
 
   def test_netinet_in(self):
     src = open(path_from_root('tests', 'netinet', 'in.cpp'), 'r').read()
@@ -5139,7 +4668,7 @@ PORT: 3979
 
   # libc++ tests
 
-  def test_iostream(self):
+  def test_iostream_and_determinism(self):
     src = '''
       #include <iostream>
 
@@ -5149,108 +4678,32 @@ PORT: 3979
         return 0;
       }
     '''
-
-    # FIXME: should not have so many newlines in output here
-    self.do_run(src, 'hello world\n77.\n')
+    num = 5
+    def test():
+      print '(iteration)'
+      time.sleep(random.random()/(10*num)) # add some timing nondeterminism here, not that we need it, but whatever
+      self.do_run(src, 'hello world\n77.\n')
+      return open('src.cpp.o.js').read()
+    builds = map(lambda i: test(), range(num))
+    print map(len, builds)
+    uniques = set(builds)
+    if len(uniques) != 1:
+      i = 0
+      for unique in uniques:
+        open('unique_' + str(i) + '.js', 'w').write(unique)
+        i += 1
+      assert 0, 'builds must be deterministic, see unique_X.js'
 
   def test_stdvec(self):
-    test_path = path_from_root('tests', 'core', 'test_stdvec')
-    src, output = (test_path + s for s in ('.in', '.out'))
-
-    self.do_run_from_file(src, output)
+    self.do_run_in_out_file_test('tests', 'core', 'test_stdvec')
 
   def test_random_device(self):
     Building.COMPILER_TEST_OPTS += ['-std=c++11']
 
-    test_path = path_from_root('tests', 'core', 'test_random_device')
-    src, output = (test_path + s for s in ('.cpp', '.txt'))
-
-    self.do_run_from_file(src, output)
+    self.do_run_in_out_file_test('tests', 'core', 'test_random_device')
 
   def test_reinterpreted_ptrs(self):
-    test_path = path_from_root('tests', 'core', 'test_reinterpreted_ptrs')
-    src, output = (test_path + s for s in ('.in', '.out'))
-
-    self.do_run_from_file(src, output)
-
-  def test_jansson(self):
-      return self.skip('currently broken')
-
-      if Settings.SAFE_HEAP: return self.skip('jansson is not safe-heap safe')
-
-      src = '''
-        #include <jansson.h>
-        #include <stdio.h>
-        #include <string.h>
-
-        int main()
-        {
-          const char* jsonString = "{\\"key\\": \\"value\\",\\"array\\": [\\"array_item1\\",\\"array_item2\\",\\"array_item3\\"],\\"dict\\":{\\"number\\": 3,\\"float\\": 2.2}}";
-
-          json_error_t error;
-          json_t *root = json_loadb(jsonString, strlen(jsonString), 0, &error);
-
-          if(!root) {
-            printf("Node `root` is `null`.");
-            return 0;
-          }
-
-          if(!json_is_object(root)) {
-            printf("Node `root` is no object.");
-            return 0;
-          }
-
-          printf("%s\\n", json_string_value(json_object_get(root, "key")));
-
-          json_t *array = json_object_get(root, "array");
-          if(!array) {
-            printf("Node `array` is `null`.");
-            return 0;
-          }
-
-          if(!json_is_array(array)) {
-            printf("Node `array` is no array.");
-            return 0;
-          }
-
-          for(size_t i=0; i<json_array_size(array); ++i)
-          {
-            json_t *arrayNode = json_array_get(array, i);
-            if(!root || !json_is_string(arrayNode))
-              return 0;
-            printf("%s\\n", json_string_value(arrayNode));
-          }
-
-          json_t *dict = json_object_get(root, "dict");
-          if(!dict || !json_is_object(dict))
-            return 0;
-
-          json_t *numberNode = json_object_get(dict, "number");
-          json_t *floatNode = json_object_get(dict, "float");
-
-          if(!numberNode || !json_is_number(numberNode) ||
-             !floatNode || !json_is_real(floatNode))
-            return 0;
-
-          printf("%i\\n", json_integer_value(numberNode));
-          printf("%.2f\\n", json_number_value(numberNode));
-          printf("%.2f\\n", json_real_value(floatNode));
-
-          json_t *invalidNode = json_object_get(dict, "invalidNode");
-          if(invalidNode)
-            return 0;
-
-          printf("%i\\n", json_number_value(invalidNode));
-
-          json_decref(root);
-
-          if(!json_is_object(root))
-            printf("jansson!\\n");
-
-          return 0;
-        }
-      '''
-      self.do_run(src, 'value\narray_item1\narray_item2\narray_item3\n3\n3.00\n2.20\nJansson: Node with ID `0` not found. Context has `10` nodes.\n0\nJansson: No JSON context.\njansson!')
+    self.do_run_in_out_file_test('tests', 'core', 'test_reinterpreted_ptrs')
 
   def test_js_libraries(self):
     open(os.path.join(self.get_dir(), 'main.cpp'), 'w').write('''
@@ -5326,7 +4779,7 @@ struct one_const addr_of_my_consts = {
 };
 
 int main(void) {
-  printf("%li\n", !!addr_of_my_consts.a);
+  printf("%li\n", (long)!!addr_of_my_consts.a);
   return 0;
 }
     ''', '1')
@@ -5399,8 +4852,10 @@ int main(void) {
   def test_dlmalloc_partial(self):
     # present part of the symbols of dlmalloc, not all
     src = open(path_from_root('tests', 'new.cpp')).read().replace('{{{ NEW }}}', 'new int').replace('{{{ DELETE }}}', 'delete') + '''
+#include <new>
+
 void *
-operator new(size_t size)
+operator new(size_t size) throw(std::bad_alloc)
 {
 printf("new %d!\\n", size);
 return malloc(size);
@@ -5408,14 +4863,14 @@ return malloc(size);
 '''
     self.do_run(src, 'new 4!\n*1,0*')
 
+  @no_wasm_backend('requires EM_ASM args support in wasm backend')
   def test_dlmalloc_partial_2(self):
-    if 'SAFE_HEAP' in str(self.emcc_args): return self.skip('only emcc will link in dlmalloc, and we do unsafe stuff')
+    if 'SAFE_HEAP' in str(self.emcc_args): return self.skip('we do unsafe stuff here')
     # present part of the symbols of dlmalloc, not all. malloc is harder to link than new which is weak.
 
-    test_path = path_from_root('tests', 'core', 'test_dlmalloc_partial_2')
-    src, output = (test_path + s for s in ('.in', '.out'))
+    Settings.NO_EXIT_RUNTIME = 1 # if we exit, then we flush streams, but the bad malloc we install here messes that up
 
-    self.do_run_from_file(src, output)
+    self.do_run_in_out_file_test('tests', 'core', 'test_dlmalloc_partial_2')
 
   def test_libcxx(self):
     self.do_run(open(path_from_root('tests', 'hashtest.cpp')).read(),
@@ -5433,28 +4888,19 @@ return malloc(size);
       ''', 'hello world');
 
   def test_typeid(self):
-    test_path = path_from_root('tests', 'core', 'test_typeid')
-    src, output = (test_path + s for s in ('.in', '.out'))
-
-    self.do_run_from_file(src, output)
+    self.do_run_in_out_file_test('tests', 'core', 'test_typeid')
 
   def test_static_variable(self):
-    test_path = path_from_root('tests', 'core', 'test_static_variable')
-    src, output = (test_path + s for s in ('.in', '.out'))
-
-    self.do_run_from_file(src, output)
+    self.do_run_in_out_file_test('tests', 'core', 'test_static_variable')
 
   def test_fakestat(self):
-    test_path = path_from_root('tests', 'core', 'test_fakestat')
-    src, output = (test_path + s for s in ('.in', '.out'))
-
-    self.do_run_from_file(src, output)
+    self.do_run_in_out_file_test('tests', 'core', 'test_fakestat')
 
   def test_mmap(self):
     Settings.TOTAL_MEMORY = 128*1024*1024
 
     test_path = path_from_root('tests', 'core', 'test_mmap')
-    src, output = (test_path + s for s in ('.in', '.out'))
+    src, output = (test_path + s for s in ('.c', '.out'))
 
     self.do_run_from_file(src, output)
     self.do_run_from_file(src, output, force_c=True)
@@ -5462,11 +4908,17 @@ return malloc(size);
   def test_mmap_file(self):
     for extra_args in [[], ['--no-heap-copy']]:
       self.emcc_args += ['--embed-file', 'data.dat'] + extra_args
-
-      open(self.in_dir('data.dat'), 'w').write('data from the file ' + ('.' * 9000))
-
+      x = 'data from the file........'
+      s = ''
+      while len(s) < 9000:
+        if len(s) + len(x) < 9000:
+          s += x
+          continue
+        s += '.'
+      assert len(s) == 9000
+      open(self.in_dir('data.dat'), 'w').write(s)
       src = open(path_from_root('tests', 'mmap_file.c')).read()
-      self.do_run(src, '*\ndata from the file .\nfrom the file ......\n*\n')
+      self.do_run(src, '*\n' + s[0:20] + '\n' + s[4096:4096+20] + '\n*\n')
 
   def test_cubescript(self):
     assert 'asm3' in test_modes
@@ -5503,104 +4955,251 @@ return malloc(size);
       self.emcc_args += ['-s', 'EMTERPRETIFY_WHITELIST=["_frexpl"]'] # test double call assertions
       test()
 
+    if not self.is_wasm():
+      print 'split memory'
+      Settings.SPLIT_MEMORY = 8*1024*1024
+      test()
+      Settings.SPLIT_MEMORY = 0
+
+  def test_relocatable_void_function(self):
+    Settings.RELOCATABLE = 1
+    self.do_run_in_out_file_test('tests', 'core', 'test_relocatable_void_function')
+
+  @SIMD
   def test_sse1(self):
-    return self.skip('TODO: This test fails due to bugs #2840, #3044, #3045, #3046 and #3048 (also see #3043 and #3049)')
+    if 'SAFE_HEAP=1' in self.emcc_args and SPIDERMONKEY_ENGINE in JS_ENGINES:
+      self.banned_js_engines += [SPIDERMONKEY_ENGINE]
+      print 'Skipping test_sse1 with SAFE_HEAP=1 on SpiderMonkey, since it fails due to NaN canonicalization.'
     Settings.PRECISE_F32 = 1 # SIMD currently requires Math.fround
 
     orig_args = self.emcc_args
     for mode in [[], ['-s', 'SIMD=1']]:
-      self.emcc_args = orig_args + mode
+      self.emcc_args = orig_args + mode + ['-msse']
       self.do_run(open(path_from_root('tests', 'test_sse1.cpp'), 'r').read(), 'Success!')
 
+  # ignore nans in some simd tests due to an LLVM regression still being investigated,
+  # https://github.com/kripken/emscripten/issues/4435
+  # https://llvm.org/bugs/show_bug.cgi?id=28510
+  @staticmethod
+  def ignore_nans(out, err = ''):
+    return '\n'.join(filter(lambda x: 'NaN' not in x, (out + '\n' + err).split('\n')))
+
   # Tests the full SSE1 API.
+  @SIMD
   def test_sse1_full(self):
-    return self.skip('TODO: This test fails due to bugs #2840, #3044, #3045, #3046 and #3048 (also see #3043 and #3049)')
-    if SPIDERMONKEY_ENGINE not in JS_ENGINES: return self.skip('test_sse1_full requires SpiderMonkey to run.')
-    Popen([CLANG, path_from_root('tests', 'test_sse1_full.cpp'), '-o', 'test_sse1_full'] + get_clang_native_args(), stdout=PIPE, stderr=PIPE).communicate()
-    native_result, err = Popen('./test_sse1_full', stdout=PIPE, stderr=PIPE).communicate()
+    Popen([CLANG, path_from_root('tests', 'test_sse1_full.cpp'), '-o', 'test_sse1_full', '-D_CRT_SECURE_NO_WARNINGS=1'] + get_clang_native_args(), env=get_clang_native_env(), stdout=PIPE).communicate()
+    native_result, err = Popen('./test_sse1_full', stdout=PIPE).communicate()
+    native_result = native_result.replace('\r\n', '\n') # Windows line endings fix
 
     Settings.PRECISE_F32 = 1 # SIMD currently requires Math.fround
     orig_args = self.emcc_args
     for mode in [[], ['-s', 'SIMD=1']]:
-      self.emcc_args = orig_args + mode + ['-I' + path_from_root('tests')]
-      self.do_run(open(path_from_root('tests', 'test_sse1_full.cpp'), 'r').read(), native_result)
+      self.emcc_args = orig_args + mode + ['-I' + path_from_root('tests'), '-msse']
+      self.do_run(open(path_from_root('tests', 'test_sse1_full.cpp'), 'r').read(), self.ignore_nans(native_result), output_nicerizer=self.ignore_nans)
 
+  # Tests the full SSE2 API.
+  @SIMD
+  def test_sse2_full(self):
+    if self.run_name == 'asm1': return self.skip("some i64 thing we can't legalize yet. possible hint: optimize with -O0 or -O2+, and not -O1");
+    import platform
+    is_64bits = platform.architecture()[0] == '64bit'
+    if not is_64bits: return self.skip('This test requires 64-bit system, since it tests SSE2 intrinsics only available in 64-bit mode!')
+
+    args = []
+    if '-O0' in self.emcc_args: args += ['-D_DEBUG=1']
+    Popen([CLANG, path_from_root('tests', 'test_sse2_full.cpp'), '-o', 'test_sse2_full', '-D_CRT_SECURE_NO_WARNINGS=1'] + args + get_clang_native_args(), env=get_clang_native_env(), stdout=PIPE).communicate()
+    native_result, err = Popen('./test_sse2_full', stdout=PIPE).communicate()
+    native_result = native_result.replace('\r\n', '\n') # Windows line endings fix
+
+    Settings.PRECISE_F32 = 1 # SIMD currently requires Math.fround
+    orig_args = self.emcc_args
+    for mode in [[], ['-s', 'SIMD=1']]:
+      self.emcc_args = orig_args + mode + ['-I' + path_from_root('tests'), '-msse2'] + args
+      self.do_run(open(path_from_root('tests', 'test_sse2_full.cpp'), 'r').read(), self.ignore_nans(native_result), output_nicerizer=self.ignore_nans)
+
+  # Tests the full SSE3 API.
+  @SIMD
+  def test_sse3_full(self):
+    args = []
+    if '-O0' in self.emcc_args: args += ['-D_DEBUG=1']
+    Popen([CLANG, path_from_root('tests', 'test_sse3_full.cpp'), '-o', 'test_sse3_full', '-D_CRT_SECURE_NO_WARNINGS=1', '-msse3'] + args + get_clang_native_args(), env=get_clang_native_env(), stdout=PIPE).communicate()
+    native_result, err = Popen('./test_sse3_full', stdout=PIPE).communicate()
+    native_result = native_result.replace('\r\n', '\n') # Windows line endings fix
+
+    Settings.PRECISE_F32 = 1 # SIMD currently requires Math.fround
+    orig_args = self.emcc_args
+    for mode in [[], ['-s', 'SIMD=1']]:
+      self.emcc_args = orig_args + mode + ['-I' + path_from_root('tests'), '-msse3'] + args
+      self.do_run(open(path_from_root('tests', 'test_sse3_full.cpp'), 'r').read(), native_result)
+
+  @SIMD
+  def test_ssse3_full(self):
+    args = []
+    if '-O0' in self.emcc_args: args += ['-D_DEBUG=1']
+    Popen([CLANG, path_from_root('tests', 'test_ssse3_full.cpp'), '-o', 'test_ssse3_full', '-D_CRT_SECURE_NO_WARNINGS=1', '-mssse3'] + args + get_clang_native_args(), env=get_clang_native_env(), stdout=PIPE).communicate()
+    native_result, err = Popen('./test_ssse3_full', stdout=PIPE).communicate()
+    native_result = native_result.replace('\r\n', '\n') # Windows line endings fix
+
+    Settings.PRECISE_F32 = 1 # SIMD currently requires Math.fround
+    orig_args = self.emcc_args
+    for mode in [[], ['-s', 'SIMD=1']]:
+      self.emcc_args = orig_args + mode + ['-I' + path_from_root('tests'), '-mssse3'] + args
+      self.do_run(open(path_from_root('tests', 'test_ssse3_full.cpp'), 'r').read(), native_result)
+
+  @SIMD
+  def test_sse4_1_full(self):
+    args = []
+    if '-O0' in self.emcc_args: args += ['-D_DEBUG=1']
+    Popen([CLANG, path_from_root('tests', 'test_sse4_1_full.cpp'), '-o', 'test_sse4_1_full', '-D_CRT_SECURE_NO_WARNINGS=1', '-msse4.1'] + args + get_clang_native_args(), env=get_clang_native_env(), stdout=PIPE).communicate()
+    native_result, err = Popen('./test_sse4_1_full', stdout=PIPE).communicate()
+    native_result = native_result.replace('\r\n', '\n') # Windows line endings fix
+
+    Settings.PRECISE_F32 = 1 # SIMD currently requires Math.fround
+    orig_args = self.emcc_args
+    for mode in [[], ['-s', 'SIMD=1']]:
+      self.emcc_args = orig_args + mode + ['-I' + path_from_root('tests'), '-msse4.1'] + args
+      self.do_run(open(path_from_root('tests', 'test_sse4_1_full.cpp'), 'r').read(), native_result)
+
+  @SIMD
   def test_simd(self):
-    if self.is_emterpreter(): return self.skip('todo')
+    self.do_run_in_out_file_test('tests', 'core', 'test_simd')
 
-    test_path = path_from_root('tests', 'core', 'test_simd')
-    src, output = (test_path + s for s in ('.in', '.out'))
-
-    self.do_run_from_file(src, output)
-
+  @SIMD
   def test_simd2(self):
-    if self.is_emterpreter(): return self.skip('todo')
+    self.do_run_in_out_file_test('tests', 'core', 'test_simd2')
 
-    test_path = path_from_root('tests', 'core', 'test_simd2')
-    src, output = (test_path + s for s in ('.in', '.out'))
-
-    self.do_run_from_file(src, output)
-
+  @SIMD
   def test_simd3(self):
-    return self.skip('FIXME: this appears to be broken')
-
+    Settings.PRECISE_F32 = 1 # SIMD currently requires Math.fround
+    self.emcc_args = self.emcc_args + ['-msse2']
     test_path = path_from_root('tests', 'core', 'test_simd3')
-    src, output = (test_path + s for s in ('.in', '.out'))
-
+    src, output = (test_path + s for s in ('.c', '.out'))
     self.do_run_from_file(src, output)
 
+  @SIMD
   def test_simd4(self):
     # test_simd4 is to test phi node handling of SIMD path
-    if self.is_emterpreter(): return self.skip('todo')
-
+    self.emcc_args = self.emcc_args + ['-msse']
     test_path = path_from_root('tests', 'core', 'test_simd4')
-    src, output = (test_path + s for s in ('.in', '.out'))
-
+    src, output = (test_path + s for s in ('.c', '.out'))
     self.do_run_from_file(src, output)
 
+  @SIMD
   def test_simd5(self):
     # test_simd5 is to test shufflevector of SIMD path
-    test_path = path_from_root('tests', 'core', 'test_simd5')
-    src, output = (test_path + s for s in ('.in', '.out'))
+    self.do_run_in_out_file_test('tests', 'core', 'test_simd5')
 
-    self.do_run_from_file(src, output)
-
+  @SIMD
   def test_simd6(self):
     # test_simd6 is to test x86 min and max intrinsics on NaN and -0.0
-    if self.is_emterpreter(): return self.skip('todo')
-
+    self.emcc_args = self.emcc_args + ['-msse']
     test_path = path_from_root('tests', 'core', 'test_simd6')
-    src, output = (test_path + s for s in ('.in', '.out'))
-
+    src, output = (test_path + s for s in ('.c', '.out'))
     self.do_run_from_file(src, output)
 
+  @SIMD
   def test_simd7(self):
-    # test_simd7 is to test negative zero handling.
-    if self.is_emterpreter(): return self.skip('todo')
-
+    # test_simd7 is to test negative zero handling: https://github.com/kripken/emscripten/issues/2791
+    self.emcc_args = self.emcc_args + ['-msse']
     test_path = path_from_root('tests', 'core', 'test_simd7')
-    src, output = (test_path + s for s in ('.in', '.out'))
-
+    src, output = (test_path + s for s in ('.c', '.out'))
     self.do_run_from_file(src, output)
 
+  @SIMD
   def test_simd8(self):
     # test_simd8 is to test unaligned load and store
-    if self.is_emterpreter(): return self.skip('todo')
-
     test_path = path_from_root('tests', 'core', 'test_simd8')
-    src, output = (test_path + s for s in ('.in', '.out'))
-
+    src, output = (test_path + s for s in ('.c', '.out'))
+    self.emcc_args = self.emcc_args + ['-msse']
     self.do_run_from_file(src, output)
 
-  def test_simd_dyncall(self):
-    if self.is_emterpreter(): return self.skip('todo')
+  @SIMD
+  def test_simd9(self):
+    # test_simd9 is to test a bug where _mm_set_ps(0.f) would generate an expression that did not validate as asm.js
+    self.emcc_args = self.emcc_args + ['-msse']
+    test_path = path_from_root('tests', 'core', 'test_simd9')
+    src, output = (test_path + s for s in ('.c', '.out'))
+    self.do_run_from_file(src, output)
 
+  @SIMD
+  def test_simd10(self):
+    # test_simd10 is to test that loading and storing arbitrary bit patterns works in SSE1.
+    self.emcc_args = self.emcc_args + ['-msse']
+    test_path = path_from_root('tests', 'core', 'test_simd10')
+    src, output = (test_path + s for s in ('.c', '.out'))
+    self.do_run_from_file(src, output)
+
+  @SIMD
+  def test_simd11(self):
+    # test_simd11 is to test that _mm_movemask_ps works correctly when handling input floats with 0xFFFFFFFF NaN bit patterns.
+    test_path = path_from_root('tests', 'core', 'test_simd11')
+    src, output = (test_path + s for s in ('.c', '.out'))
+    self.emcc_args = self.emcc_args + ['-msse2']
+    self.do_run_from_file(src, output)
+
+  @SIMD
+  def test_simd12(self):
+    self.emcc_args = self.emcc_args + ['-msse']
+    test_path = path_from_root('tests', 'core', 'test_simd12')
+    src, output = (test_path + s for s in ('.c', '.out'))
+    self.do_run_from_file(src, output)
+
+  @SIMD
+  def test_simd13(self):
+    self.emcc_args = self.emcc_args + ['-msse']
+    test_path = path_from_root('tests', 'core', 'test_simd13')
+    src, output = (test_path + s for s in ('.c', '.out'))
+    self.do_run_from_file(src, output)
+
+  @SIMD
+  def test_simd14(self):
+    self.emcc_args = self.emcc_args + ['-msse', '-msse2']
+    test_path = path_from_root('tests', 'core', 'test_simd14')
+    src, output = (test_path + s for s in ('.c', '.out'))
+    self.do_run_from_file(src, output)
+
+  @SIMD
+  def test_simd15(self):
+    if self.run_name == 'asm1': return self.skip('legalizing -O1 output is much harder, and not worth it - we work on -O0 and -O2+')
+    self.emcc_args = self.emcc_args + ['-msse', '-msse2']
+    test_path = path_from_root('tests', 'core', 'test_simd15')
+    src, output = (test_path + s for s in ('.c', '.out'))
+    self.do_run_from_file(src, output)
+
+  @SIMD
+  def test_simd16(self):
+    self.emcc_args = self.emcc_args + ['-msse', '-msse2']
+    self.do_run_in_out_file_test('tests', 'core', 'test_simd16')
+
+  @SIMD
+  def test_simd_float64x2(self):
+    self.do_run_in_out_file_test('tests', 'core', 'test_simd_float64x2')
+
+  @SIMD
+  def test_simd_float32x4(self):
+    self.do_run_in_out_file_test('tests', 'core', 'test_simd_float32x4')
+
+  @SIMD
+  def test_simd_int32x4(self):
+    self.do_run_in_out_file_test('tests', 'core', 'test_simd_int32x4')
+
+  @SIMD
+  def test_simd_int16x8(self):
+    self.do_run_in_out_file_test('tests', 'core', 'test_simd_int16x8')
+
+  @SIMD
+  def test_simd_int8x16(self):
+    self.do_run_in_out_file_test('tests', 'core', 'test_simd_int8x16')
+
+  @SIMD
+  def test_simd_dyncall(self):
+    self.emcc_args = self.emcc_args + ['-msse']
     test_path = path_from_root('tests', 'core', 'test_simd_dyncall')
     src, output = (test_path + s for s in ('.cpp', '.txt'))
     self.do_run_from_file(src, output)
 
   def test_gcc_unmangler(self):
-    Building.COMPILER_TEST_OPTS += ['-I' + path_from_root('third_party'), '-Wno-warn-absolute-paths']
+    Building.COMPILER_TEST_OPTS += ['-I' + path_from_root('third_party')]
 
     self.do_run(open(path_from_root('third_party', 'gcc_demangler.c')).read(), '*d_demangle(char const*, int, unsigned int*)*', args=['_ZL10d_demanglePKciPj'])
 
@@ -5629,7 +5228,9 @@ return malloc(size);
     return self.get_library('freetype',
                             os.path.join('objs', '.libs', 'libfreetype.a'))
 
+  @no_wasm_backend()
   def test_freetype(self):
+    if WINDOWS: return self.skip('test_freetype uses a ./configure script to build and therefore currently only runs on Linux and OS X.')
     assert 'asm2g' in test_modes
     if self.run_name == 'asm2g':
       Settings.ALIASING_FUNCTION_POINTERS = 1 - Settings.ALIASING_FUNCTION_POINTERS # flip for some more coverage here
@@ -5640,7 +5241,7 @@ def process(filename):
   # Embed the font into the document
   src = open(filename, 'r').read().replace(
     '// {{PRE_RUN_ADDITIONS}}',
-    "FS.createDataFile('/', 'font.ttf', %s, true, false);" % str(
+    "FS.createDataFile('/', 'font.ttf', %s, true, false, false);" % str(
       map(ord, open(shared.path_from_root('tests', 'freetype', 'LiberationSansBold.ttf'), 'rb').read())
     )
   )
@@ -5660,6 +5261,7 @@ def process(filename):
                    libraries=self.get_freetype(),
                    includes=[path_from_root('tests', 'freetype', 'include')],
                    post_build=post)
+      Settings.OUTLINING_LIMIT = 0
 
     # github issue 324
     print '[issue 324]'
@@ -5689,6 +5291,7 @@ def process(filename):
     self.banned_js_engines = [NODE_JS] # OOM in older node
     if '-O' not in str(self.emcc_args):
       self.banned_js_engines += [SPIDERMONKEY_ENGINE] # SM bug 1066759
+    if self.is_split_memory(): return self.skip('SM bug 1205121')
 
     Settings.DISABLE_EXCEPTION_CATCHING = 1
     Settings.EXPORTED_FUNCTIONS += ['_sqlite3_open', '_sqlite3_close', '_sqlite3_exec', '_sqlite3_free', '_callback'];
@@ -5710,7 +5313,7 @@ def process(filename):
                  force_c=True)
 
   def test_zlib(self):
-    if '-O2' in self.emcc_args and 'ASM_JS=0' not in self.emcc_args: # without asm, closure minifies Math.imul badly
+    if '-O2' in self.emcc_args and 'ASM_JS=0' not in self.emcc_args and not self.is_wasm(): # without asm, closure minifies Math.imul badly
       self.emcc_args += ['--closure', '1'] # Use closure here for some additional coverage
 
     assert 'asm2g' in test_modes
@@ -5748,7 +5351,8 @@ def process(filename):
         self.do_run(open(path_from_root('tests', 'bullet', 'Demos', 'HelloWorld', 'HelloWorld.cpp'), 'r').read(),
                      [open(path_from_root('tests', 'bullet', 'output.txt'), 'r').read(), # different roundings
                       open(path_from_root('tests', 'bullet', 'output2.txt'), 'r').read(),
-                      open(path_from_root('tests', 'bullet', 'output3.txt'), 'r').read()],
+                      open(path_from_root('tests', 'bullet', 'output3.txt'), 'r').read(),
+                      open(path_from_root('tests', 'bullet', 'output4.txt'), 'r').read()],
                      libraries=get_bullet_library(self, use_cmake),
                      includes=[path_from_root('tests', 'bullet', 'src')])
       test()
@@ -5767,57 +5371,77 @@ def process(filename):
         assert len(old) > len(new)
         assert old.count('tempBigInt') > new.count('tempBigInt')
 
+  @no_wasm_backend()
   def test_poppler(self):
-    Settings.NO_EXIT_RUNTIME = 1
+    if WINDOWS: return self.skip('test_poppler depends on freetype, which uses a ./configure script to build and therefore currently only runs on Linux and OS X.')
 
-    Building.COMPILER_TEST_OPTS += [
-      '-I' + path_from_root('tests', 'freetype', 'include'),
-      '-I' + path_from_root('tests', 'poppler', 'include'),
-      '-Wno-warn-absolute-paths'
-    ]
+    def test():
+      Settings.NO_EXIT_RUNTIME = 1
 
-    Settings.INVOKE_RUN = 0 # We append code that does run() ourselves
+      Building.COMPILER_TEST_OPTS += [
+        '-I' + path_from_root('tests', 'freetype', 'include'),
+        '-I' + path_from_root('tests', 'poppler', 'include')
+      ]
 
-    # See post(), below
-    input_file = open(os.path.join(self.get_dir(), 'paper.pdf.js'), 'w')
-    input_file.write(str(map(ord, open(path_from_root('tests', 'poppler', 'paper.pdf'), 'rb').read())))
-    input_file.close()
+      Settings.INVOKE_RUN = 0 # We append code that does run() ourselves
 
-    post = '''
+      # See post(), below
+      input_file = open(os.path.join(self.get_dir(), 'paper.pdf.js'), 'w')
+      input_file.write(str(map(ord, open(path_from_root('tests', 'poppler', 'paper.pdf'), 'rb').read())))
+      input_file.close()
+
+      post = '''
 def process(filename):
   # To avoid loading this large file to memory and altering it, we simply append to the end
   src = open(filename, 'a')
   src.write(
     \'\'\'
-      FS.createDataFile('/', 'paper.pdf', eval(Module.read('paper.pdf.js')), true, false);
+      FS.createDataFile('/', 'paper.pdf', eval(Module.read('paper.pdf.js')), true, false, false);
       Module.callMain(Module.arguments);
       Module.print("Data: " + JSON.stringify(MEMFS.getFileDataAsRegularArray(FS.root.contents['filename-1.ppm']).map(function(x) { return unSign(x, 8) })));
     \'\'\'
   )
   src.close()
 '''
+ 
+ #fontconfig = self.get_library('fontconfig', [os.path.join('src', '.libs', 'libfontconfig.a')]) # Used in file, but not needed, mostly
 
-    #fontconfig = self.get_library('fontconfig', [os.path.join('src', '.libs', 'libfontconfig.a')]) # Used in file, but not needed, mostly
+      freetype = self.get_freetype()
 
-    freetype = self.get_freetype()
+      poppler = self.get_library('poppler',
+                                 [os.path.join('utils', 'pdftoppm.o'),
+                                  os.path.join('utils', 'parseargs.o'),
+                                  os.path.join('poppler', '.libs', 'libpoppler.a')],
+                                 env_init={ 'FONTCONFIG_CFLAGS': ' ', 'FONTCONFIG_LIBS': ' ' },
+                                 configure_args=['--disable-libjpeg', '--disable-libpng', '--disable-poppler-qt', '--disable-poppler-qt4', '--disable-cms', '--disable-cairo-output', '--disable-abiword-output', '--enable-shared=no'])
 
-    poppler = self.get_library('poppler',
-                               [os.path.join('utils', 'pdftoppm.o'),
-                                os.path.join('utils', 'parseargs.o'),
-                                os.path.join('poppler', '.libs', 'libpoppler.a')],
-                               env_init={ 'FONTCONFIG_CFLAGS': ' ', 'FONTCONFIG_LIBS': ' ' },
-                               configure_args=['--disable-libjpeg', '--disable-libpng', '--disable-poppler-qt', '--disable-poppler-qt4', '--disable-cms', '--disable-cairo-output', '--disable-abiword-output', '--enable-shared=no'])
+      # Combine libraries
 
-    # Combine libraries
+      combined = os.path.join(self.get_dir(), 'poppler-combined.bc')
+      Building.link(poppler + freetype, combined)
 
-    combined = os.path.join(self.get_dir(), 'poppler-combined.bc')
-    Building.link(poppler + freetype, combined)
+      self.do_ll_run(combined,
+                     map(ord, open(path_from_root('tests', 'poppler', 'ref.ppm'), 'r').read()).__str__().replace(' ', ''),
+                     args='-scale-to 512 paper.pdf filename'.split(' '),
+                     post_build=post)
+                     #, build_ll_hook=self.do_autodebug)
 
-    self.do_ll_run(combined,
-                   map(ord, open(path_from_root('tests', 'poppler', 'ref.ppm'), 'r').read()).__str__().replace(' ', ''),
-                   args='-scale-to 512 paper.pdf filename'.split(' '),
-                   post_build=post)
-                   #, build_ll_hook=self.do_autodebug)
+    test()
+    num_original_funcs = self.count_funcs('src.cpp.o.js')
+
+    # Run with duplicate function elimination turned on
+    dfe_supported_opt_levels = ['-O2', '-O3', '-Oz', '-Os']
+
+    for opt_level in dfe_supported_opt_levels:
+      if opt_level in self.emcc_args:
+        print >> sys.stderr, "Testing poppler with ELIMINATE_DUPLICATE_FUNCTIONS set to 1"
+        Settings.ELIMINATE_DUPLICATE_FUNCTIONS = 1
+        test()
+
+        # Make sure that DFE ends up eliminating more than 200 functions (if we can view source)
+        if not self.is_wasm():
+          assert (num_original_funcs - self.count_funcs('src.cpp.o.js')) > 200
+        break
 
   def test_openjpeg(self):
     Building.COMPILER_TEST_OPTS = filter(lambda x: x != '-g', Building.COMPILER_TEST_OPTS) # remove -g, so we have one test without it by default
@@ -5828,7 +5452,7 @@ def process(filename):
   original_j2k = shared.path_from_root('tests', 'openjpeg', 'syntensity_lobby_s.j2k')
   src = open(filename, 'r').read().replace(
     '// {{PRE_RUN_ADDITIONS}}',
-    "FS.createDataFile('/', 'image.j2k', %s, true, false);" % shared.line_splitter(str(
+    "FS.createDataFile('/', 'image.j2k', %s, true, false, false);" % shared.line_splitter(str(
       map(ord, open(original_j2k, 'rb').read())
     ))
   ).replace(
@@ -5879,9 +5503,9 @@ def process(filename):
 
       image_mean = 83.265
       #print '[image stats:', js_mean, image_mean, true_mean, diff_mean, num, ']'
-      assert abs(js_mean - image_mean) < 0.01
-      assert abs(true_mean - image_mean) < 0.01
-      assert diff_mean < 0.01
+      assert abs(js_mean - image_mean) < 0.01, [js_mean, image_mean]
+      assert abs(true_mean - image_mean) < 0.01, [true_mean, image_mean]
+      assert diff_mean < 0.01, diff_mean
 
       return output
 
@@ -5945,6 +5569,7 @@ def process(filename):
       Settings.ALLOW_MEMORY_GROWTH = 0
       do_test()
 
+  @no_wasm_backend("python.bc was compiled with asmjs, and we don't have unified triples")
   def test_python(self):
     Settings.EMULATE_FUNCTION_POINTER_CASTS = 1
 
@@ -5975,16 +5600,20 @@ def process(filename):
   # Test cases in separate files. Note that these files may contain invalid .ll!
   # They are only valid enough for us to read for test purposes, not for llvm-as
   # to process.
+  @no_wasm_backend()
   def test_cases(self):
     if Building.LLVM_OPTS: return self.skip("Our code is not exactly 'normal' llvm assembly")
 
     emcc_args = self.emcc_args
 
     # The following tests link to libc, and must be run with EMCC_LEAVE_INPUTS_RAW = 0
-    need_no_leave_inputs_raw = ['muli33_ta2', 'philoop_ta2']
+    need_no_leave_inputs_raw = ['muli33_ta2', 'philoop_ta2', 'uadd_overflow_64_ta2', 'i64toi8star', 'legalizer_ta2', 'quotedlabel', 'alignedunaligned', 'sillybitcast', 'invokeundef', 'loadbitcastgep', 'sillybitcast2', 'legalizer_b_ta2', 'emptystruct', 'entry3', 'atomicrmw_i64', 'atomicrmw_b_i64', 'invoke_byval', 'i24_ce_fastcomp']
 
     try:
-      for name in glob.glob(path_from_root('tests', 'cases', '*.ll')):
+      import random
+      names = glob.glob(path_from_root('tests', 'cases', '*.ll'))
+      #random.shuffle(names)
+      for name in names:
         shortname = name.replace('.ll', '')
         if '' not in shortname: continue
         # TODO: test only worked in non-fastcomp (well, these cases)
@@ -5995,12 +5624,22 @@ def process(filename):
           'quoted', # current fastcomp limitations FIXME
           'atomicrmw_unaligned', # TODO XXX
         ]: continue
-        if self.is_emterpreter() and os.path.basename(shortname) in ['funcptr']: continue # test writes to memory we store out bytecode! test is invalid
-
+        if self.is_emterpreter() and os.path.basename(shortname) in [
+          'funcptr', # test writes to memory we store out bytecode! test is invalid
+          'i1282vecnback', # uses simd
+        ]:
+          continue
+        if self.is_wasm() and os.path.basename(shortname) in [
+          'i1282vecnback', # uses simd
+          'call_inttoptr_i64', # casts a function pointer from (i32, i32)* to (i64)*, which happens to work in asm.js but is a general function pointer undefined behavior
+        ]:
+          continue
         if os.path.basename(shortname) in need_no_leave_inputs_raw:
           if 'EMCC_LEAVE_INPUTS_RAW' in os.environ: del os.environ['EMCC_LEAVE_INPUTS_RAW']
+          Settings.NO_FILESYSTEM = 0
         else:
           os.environ['EMCC_LEAVE_INPUTS_RAW'] = '1'
+          Settings.NO_FILESYSTEM = 1 # no libc is linked in; with NO_FILESYSTEM we have a chance at printfing anyhow
 
         if '_noasm' in shortname and Settings.ASM_JS:
           print self.skip('case "%s" not relevant for asm.js' % shortname)
@@ -6028,7 +5667,8 @@ def process(filename):
       self.emcc_args = emcc_args
 
   def test_fuzz(self):
-    Building.COMPILER_TEST_OPTS += ['-I' + path_from_root('tests', 'fuzz', 'include'), '-Wno-warn-absolute-paths']
+    Building.COMPILER_TEST_OPTS += ['-I' + path_from_root('tests', 'fuzz', 'include'), '-w']
+    Settings.BINARYEN_IMPRECISE = 0 # some of these tests - 2.c', '9.c', '19.c', '21.c', '20.cpp' - div or rem i32 by 0, which traps in wasm
 
     def run_all(x):
       print x
@@ -6041,6 +5681,7 @@ def process(filename):
         ]: continue
         if x == 'lto' and self.run_name == 'default' and os.path.basename(name) in [
           '19.c', '18.cpp', # LLVM LTO bug
+          '23.cpp', # puts exists before LTO, but is not used; LTO cleans it out, but then creates uses to it (printf=>puts) XXX https://llvm.org/bugs/show_bug.cgi?id=23814
         ]: continue
         if x == 'lto' and os.path.basename(name) in [
           '21.c'
@@ -6083,7 +5724,7 @@ def process(filename):
 
     # Run a test that should work, generating some code
     test_path = path_from_root('tests', 'core', 'test_structs')
-    src, output = (test_path + s for s in ('.in', '.out'))
+    src, output = (test_path + s for s in ('.c', '.out'))
     self.do_run_from_file(src, output, build_ll_hook=lambda x: False) # add an ll hook, to force ll generation
 
     filename = os.path.join(self.get_dir(), 'src.cpp')
@@ -6091,7 +5732,6 @@ def process(filename):
 
     # Compare to each other, and to expected output
     self.do_ll_run(path_from_root('tests', filename+'.o.ll.ll'), '''AD:-1,1''')
-    assert open('stdout').read().startswith('AD:-1'), 'We must note when we enter functions'
 
     # Test using build_ll_hook
     src = '''
@@ -6113,26 +5753,24 @@ def process(filename):
 
   ### Integration tests
 
+  @no_wasm_backend()
   def test_ccall(self):
     post = '''
 def process(filename):
-  src = \'\'\'
-    var Module = { 'noInitialRun': true };
-    \'\'\' + open(filename, 'r').read() + \'\'\'
-    Module.addOnExit(function () {
+  src = open(filename, 'r').read() + \'\'\'
       Module.print('*');
       var ret;
-      ret = Module['ccall']('get_int', 'number'); Module.print([typeof ret, ret]);
-      ret = ccall('get_float', 'number'); Module.print([typeof ret, ret.toFixed(2)]);
-      ret = ccall('get_string', 'string'); Module.print([typeof ret, ret]);
+      ret = Module['ccall']('get_int', 'number'); Module.print([typeof ret, ret].join(','));
+      ret = ccall('get_float', 'number'); Module.print([typeof ret, ret.toFixed(2)].join(','));
+      ret = ccall('get_string', 'string'); Module.print([typeof ret, ret].join(','));
       ret = ccall('print_int', null, ['number'], [12]); Module.print(typeof ret);
       ret = ccall('print_float', null, ['number'], [14.56]); Module.print(typeof ret);
       ret = ccall('print_string', null, ['string'], ["cheez"]); Module.print(typeof ret);
       ret = ccall('print_string', null, ['array'], [[97, 114, 114, 45, 97, 121, 0]]); Module.print(typeof ret);
-      ret = ccall('multi', 'number', ['number', 'number', 'number', 'string'], [2, 1.4, 3, 'more']); Module.print([typeof ret, ret]);
+      ret = ccall('multi', 'number', ['number', 'number', 'number', 'string'], [2, 1.4, 3, 'more']); Module.print([typeof ret, ret].join(','));
       var p = ccall('malloc', 'pointer', ['number'], [4]);
       setValue(p, 650, 'i32');
-      ret = ccall('pointer', 'pointer', ['pointer'], [p]); Module.print([typeof ret, getValue(ret, 'i32')]);
+      ret = ccall('pointer', 'pointer', ['pointer'], [p]); Module.print([typeof ret, getValue(ret, 'i32')].join(','));
       Module.print('*');
       // part 2: cwrap
       var noThirdParam = Module['cwrap']('get_int', 'number');
@@ -6147,23 +5785,19 @@ def process(filename):
       }
       Module.print('stack is ok.');
       ccall('call_ccall_again', null);
-    });
-    Module.callMain();
   \'\'\'
   open(filename, 'w').write(src)
 '''
 
     Settings.EXPORTED_FUNCTIONS += ['_get_int', '_get_float', '_get_string', '_print_int', '_print_float', '_print_string', '_multi', '_pointer', '_call_ccall_again', '_malloc']
-    test_path = path_from_root('tests', 'core', 'test_ccall')
-    src, output = (test_path + s for s in ('.in', '.out'))
-
-    self.do_run_from_file(src, output, post_build=post)
+    self.do_run_in_out_file_test('tests', 'core', 'test_ccall', post_build=post)
 
     if '-O2' in self.emcc_args or self.is_emterpreter():
       print 'with closure'
       self.emcc_args += ['--closure', '1']
-      self.do_run_from_file(src, output, post_build=post)
+      self.do_run_in_out_file_test('tests', 'core', 'test_ccall', post_build=post)
 
+  @no_wasm_backend()
   def test_dead_functions(self):
     src = r'''
       #include <stdio.h>
@@ -6318,6 +5952,7 @@ def process(filename):
     shutil.move(self.in_dir('src.cpp.o.js'), self.in_dir('pgoed2.js'))
     assert open('pgoed.js').read() == open('pgoed2.js').read()
 
+  @no_wasm_backend()
   def test_exported_response(self):
     src = r'''
       #include <stdio.h>
@@ -6341,59 +5976,78 @@ def process(filename):
     self.do_run(src, '''waka 5!''')
     assert 'other_function' in open('src.cpp.o.js').read()
 
-  def test_add_function(self):
-    Settings.INVOKE_RUN = 0
-    Settings.RESERVED_FUNCTION_POINTERS = 1
-
+  @no_wasm_backend()
+  def test_large_exported_response(self):
     src = r'''
       #include <stdio.h>
       #include <stdlib.h>
       #include <emscripten.h>
 
-      int main(int argc, char **argv) {
-        int fp = atoi(argv[1]);
-        printf("fp: %d\n", fp);
-        void (*f)(int) = reinterpret_cast<void (*)(int)>(fp);
-        f(7);
-        EM_ASM_(Module['Runtime']['removeFunction']($0), f);
-        printf("ok\n");
+      extern "C" {
+      '''
+
+    js_funcs = []
+    num_exports = 5000
+    count = 0
+    while count < num_exports:
+        src += 'int exported_func_from_response_file_%d () { return %d;}\n' % (count, count)
+        js_funcs.append('_exported_func_from_response_file_%d' % count)
+        count += 1
+
+    src += r'''
+      }
+
+      int main() {
+        int x = EM_ASM_INT_V({ return Module._exported_func_from_response_file_4999() });
+        emscripten_run_script_string(""); // Add a reference to a symbol that exists in src/deps_info.json to uncover issue #2836 in the test suite.
+        printf("waka %d!\n", x);
         return 0;
       }
     '''
 
-    open(os.path.join(self.get_dir(), 'post.js'), 'w').write('''
-      var newFuncPtr = Runtime.addFunction(function(num) {
-        Module.print('Hello ' + num + ' from JS!');
-      });
-      Module.callMain([newFuncPtr.toString()]);
-    ''')
+    js_funcs.append('_main')
+    exported_func_json_file = os.path.join(self.get_dir(), 'large_exported_response.json')
+    open(exported_func_json_file, 'wb').write(json.dumps(js_funcs))
 
-    expected = '''Hello 7 from JS!\nok\n'''
-    self.emcc_args += ['--post-js', 'post.js']
-    self.do_run(src, expected)
+    self.emcc_args += ['-s', 'EXPORTED_FUNCTIONS=@' + exported_func_json_file]
+    self.do_run(src, '''waka 4999!''')
+    assert '_exported_func_from_response_file_1' in open('src.cpp.o.js').read()
+
+  @no_wasm_backend('requires EM_ASM args support in wasm backend')
+  def test_add_function(self):
+    Settings.INVOKE_RUN = 0
+    Settings.RESERVED_FUNCTION_POINTERS = 1
+
+    test_path = path_from_root('tests', 'interop')
+    src, expected = (os.path.join(test_path, s) for s in ('test_add_function.cpp', 'test_add_function.out'))
+
+    post_js = os.path.join(test_path, 'test_add_function_post.js')
+    self.emcc_args += ['--post-js', post_js]
+    self.do_run_from_file(src, expected)
 
     if Settings.ASM_JS:
       Settings.RESERVED_FUNCTION_POINTERS = 0
-      self.do_run(src, '''Finished up all reserved function pointers. Use a higher value for RESERVED_FUNCTION_POINTERS.''')
+      self.do_run(open(src).read(), '''Finished up all reserved function pointers. Use a higher value for RESERVED_FUNCTION_POINTERS.''')
       generated = open('src.cpp.o.js').read()
       assert 'jsCall' not in generated
       Settings.RESERVED_FUNCTION_POINTERS = 1
 
       Settings.ALIASING_FUNCTION_POINTERS = 1 - Settings.ALIASING_FUNCTION_POINTERS # flip the test
-      self.do_run(src, expected)
+      self.do_run_from_file(src, expected)
 
     assert 'asm2' in test_modes
     if self.run_name == 'asm2':
       print 'closure'
       self.banned_js_engines = [NODE_JS] # weird global handling in node
       self.emcc_args += ['--closure', '1']
-      self.do_run(src, expected)
+      self.do_run_from_file(src, expected)
 
     print 'function pointer emulation'
     Settings.RESERVED_FUNCTION_POINTERS = 0
     Settings.EMULATED_FUNCTION_POINTERS = 1 # with emulation, we don't need to reserve
-    self.do_run(src, expected)
+    self.do_run_from_file(src, expected)
 
+  @no_wasm_backend('requires EM_ASM args support in wasm backend')
   def test_getFuncWrapper_sig_alias(self):
     src = r'''
     #include <stdio.h>
@@ -6416,47 +6070,154 @@ def process(filename):
     '''
     self.do_run(src, 'func1\nfunc2\n')
 
+  @no_wasm_backend()
   def test_emulate_function_pointer_casts(self):
     Settings.EMULATE_FUNCTION_POINTER_CASTS = 1
 
     src = r'''
     #include <stdio.h>
     #include <math.h>
+    
+    // We have to use a proxy function 'acos_test' here because the updated libc++ library provides a set of overloads to acos,
+    // this has the result that we can't take the function pointer to acos anymore due to failed overload resolution.
+    // This proxy function has no overloads so it's allowed to take the function pointer directly.
+    double acos_test(double x) {
+      return acos(x);
+    }
 
     typedef double (*ddd)(double x, double unused);
     typedef int    (*iii)(int x,    int unused);
 
     int main() {
-      volatile ddd d = (ddd)acos;
-      volatile iii i = (iii)acos;
+      volatile ddd d = (ddd)acos_test;
+      volatile iii i = (iii)acos_test;
       printf("|%.3f,%d|\n", d(0.3, 0.6), i(0, 0));
       return 0;
     }
     '''
     self.do_run(src, '|1.266,1|\n')
 
+  @no_wasm_backend()
   def test_demangle_stacks(self):
-    if Settings.ASM_JS: return self.skip('spidermonkey has stack trace issues')
+    if self.is_wasm():
+      self.banned_js_engines = [V8_ENGINE] # https://bugs.chromium.org/p/v8/issues/detail?id=5632
+    Settings.DEMANGLE_SUPPORT = 1
+    if '-O' in str(self.emcc_args):
+      self.emcc_args += ['--profiling-funcs', '--llvm-opts', '0']
 
-    test_path = path_from_root('tests', 'core', 'test_demangle_stacks')
-    src, output = (test_path + s for s in ('.in', '.out'))
+    self.do_run_in_out_file_test('tests', 'core', 'test_demangle_stacks')
 
-    self.do_run_from_file(src, output)
+  @no_emterpreter
+  @no_wasm_backend()
+  def test_demangle_stacks_symbol_map(self):
+    Settings.DEMANGLE_SUPPORT = 1
+    if '-O' in str(self.emcc_args) and '-O0' not in self.emcc_args and '-O1' not in self.emcc_args and '-g' not in self.emcc_args:
+      self.emcc_args += ['--llvm-opts', '0']
+    else:
+      return self.skip("without opts, we don't emit a symbol map")
+    self.emcc_args += ['--emit-symbol-map']
+    self.do_run(open(path_from_root('tests', 'core', 'test_demangle_stacks.c')).read(), 'abort')
+    # make sure the shortened name is the right one
+    symbols = open('src.cpp.o.js.symbols').read().split('\n')
+    for line in symbols:
+      if ':' not in line: continue
+      short, full = line.split(':')
+      if 'Aborter' in full:
+        short_aborter = short
+        full_aborter = full
+    print 'full:', full_aborter, 'short:', short_aborter
+    if SPIDERMONKEY_ENGINE and os.path.exists(SPIDERMONKEY_ENGINE[0]):
+      output = run_js('src.cpp.o.js', engine=SPIDERMONKEY_ENGINE, stderr=PIPE, full_output=True, assert_returncode=None)
+      # we may see the full one, if -g, or the short one if not
+      if ' ' + short_aborter + ' ' not in output and ' ' + full_aborter + ' ' not in output:
+        # stack traces may also be ' name ' or 'name@' etc
+        if '\n' + short_aborter + ' ' not in output and '\n' + full_aborter + ' ' not in output and 'wasm-function[' + short_aborter + ']' not in output:
+          if '\n' + short_aborter + '@' not in output and '\n' + full_aborter + '@' not in output:
+            self.assertContained(' ' + short_aborter + ' ' + '\n' + ' ' + full_aborter + ' ', output)
 
   def test_tracing(self):
     Building.COMPILER_TEST_OPTS += ['--tracing']
 
-    test_path = path_from_root('tests', 'core', 'test_tracing')
-    src, output = (test_path + s for s in ('.in', '.out'))
+    self.do_run_in_out_file_test('tests', 'core', 'test_tracing')
 
-    self.do_run_from_file(src, output)
+  @no_wasm_backend()
+  def test_eval_ctors(self):
+    if '-O2' not in str(self.emcc_args) or '-O1' in str(self.emcc_args): return self.skip('need js optimizations')
+
+    orig_args = self.emcc_args[:] + ['-s', 'EVAL_CTORS=0']
+
+    print 'leave printf in ctor'
+    self.emcc_args = orig_args + ['-s', 'EVAL_CTORS=1']
+    self.do_run(r'''
+      #include <stdio.h>
+      struct C {
+        C() { printf("constructing!\n"); } // don't remove this!
+      };
+      C c;
+      int main() {}
+    ''', "constructing!\n");
+
+    code_file = 'src.cpp.o.js' if not Settings.BINARYEN else 'src.cpp.o.wasm'
+
+    def do_test(test):
+      self.emcc_args = orig_args + ['-s', 'EVAL_CTORS=1']
+      test()
+      ec_code_size = os.stat(code_file).st_size
+      if self.uses_memory_init_file():
+        ec_mem_size = os.stat('src.cpp.o.js.mem').st_size
+      self.emcc_args = orig_args[:]
+      test()
+      code_size = os.stat(code_file).st_size
+      if self.uses_memory_init_file():
+        mem_size = os.stat('src.cpp.o.js.mem').st_size
+      # if we are wasm, then eval-ctors disables wasm-only, losing i64 opts, increasing size
+      code_size_should_shrink = not self.is_wasm()
+      print code_size, ' => ', ec_code_size, ', are we testing code size?', code_size_should_shrink
+      if self.uses_memory_init_file():
+        print mem_size, ' => ', ec_mem_size
+      if code_size_should_shrink:
+        assert ec_code_size < code_size
+      if self.uses_memory_init_file():
+        assert ec_mem_size > mem_size
+
+    print 'remove ctor of just assigns to memory'
+    def test1():
+      self.do_run(r'''
+        #include <stdio.h>
+        struct C {
+          int x;
+          C() {
+            volatile int y = 10;
+            y++;
+            x = y;
+          }
+        };
+        C c;
+        int main() {
+          printf("x: %d\n", c.x);
+        }
+      ''', "x: 11\n");
+    do_test(test1)
+
+    print 'libcxx - remove 2 ctors from iostream code'
+
+    src = open(path_from_root('tests', 'hello_libcxx.cpp')).read()
+    output = 'hello, world!'
+
+    def test2():
+      self.do_run(src, output)
+    do_test(test2)
+
+    print 'assertions too'
+    Settings.ASSERTIONS = 1
+    self.do_run(src, output)
 
   def test_embind(self):
     Building.COMPILER_TEST_OPTS += ['--bind']
 
     src = r'''
-      #include<stdio.h>
-      #include<emscripten/val.h>
+      #include <stdio.h>
+      #include <emscripten/val.h>
 
       using namespace emscripten;
 
@@ -6494,6 +6255,69 @@ def process(filename):
     '''
     self.do_run(src, 'lerp 166');
 
+  def test_embind_3(self):
+    Settings.NO_EXIT_RUNTIME = 1 # we emit some post.js that we need to see
+    Building.COMPILER_TEST_OPTS += ['--bind', '--post-js', 'post.js']
+    open('post.js', 'w').write('''
+      function ready() {
+        try {
+          Module.compute(new Uint8Array([1,2,3]));
+        } catch(e) {
+          Module.print(e);
+        }
+      }
+    ''')
+    src = r'''
+      #include <emscripten.h>
+      #include <emscripten/bind.h>
+      using namespace emscripten;
+      int compute(int array[]) {
+          return 0;
+      }
+      EMSCRIPTEN_BINDINGS(my_module) {
+          function("compute", &compute, allow_raw_pointers());
+      }
+      int main(int argc, char **argv) {
+          EM_ASM(ready());
+          return 0;
+      }
+    '''
+    self.do_run(src, 'UnboundTypeError: Cannot call compute due to unbound types: Pi');
+
+  @no_wasm_backend('long doubles are f128s in wasm backend')
+  def test_embind_4(self):
+    Building.COMPILER_TEST_OPTS += ['--bind', '--post-js', 'post.js']
+    open('post.js', 'w').write('''
+      function printFirstElement() {
+        Module.print(Module.getBufferView()[0]);
+      }
+    ''')
+    src = r'''
+      #include <emscripten.h>
+      #include <emscripten/bind.h>
+      #include <emscripten/val.h>
+      #include <stdio.h>
+      using namespace emscripten;
+
+      const size_t kBufferSize = 1024;
+      long double buffer[kBufferSize];
+      val getBufferView(void) {
+          val v = val(typed_memory_view(kBufferSize, buffer));
+          return v;
+      }
+      EMSCRIPTEN_BINDINGS(my_module) {
+          function("getBufferView", &getBufferView);
+      }
+
+      int main(int argc, char **argv) {
+        buffer[0] = 107;
+        EM_ASM(printFirstElement());
+        return 0;
+      }
+    '''
+    self.do_run(src, '107')
+
+  @no_wasm_backend()
   def test_scriptaclass(self):
       Settings.EXPORT_BINDINGS = 1
 
@@ -6542,7 +6366,7 @@ def process(filename):
 '''
       # XXX disable due to possible v8 bug -- self.do_run(src, '*166*\n*ok*', post_build=post)
 
-      if '-O2' in self.emcc_args and 'ASM_JS=0' not in self.emcc_args: # without asm, closure minifies Math.imul badly
+      if '-O2' in self.emcc_args and 'ASM_JS=0' not in self.emcc_args and not self.is_wasm(): # without asm, closure minifies Math.imul badly
         self.emcc_args += ['--closure', '1'] # Use closure here, to test we export things right
 
       # Way 2: use CppHeaderParser
@@ -6740,6 +6564,7 @@ Child2:9
 *ok*
 ''', post_build=(post2, post3))
 
+  @no_wasm_backend()
   def test_scriptaclass_2(self):
       Settings.EXPORT_BINDINGS = 1
 
@@ -6784,6 +6609,7 @@ def process(filename):
 '''
       self.do_run(src, '|hello|43|world|41|', post_build=post)
 
+  @no_wasm_backend()
   def test_webidl(self):
     assert 'asm2' in test_modes
     if self.run_name == 'asm2':
@@ -6807,7 +6633,7 @@ def process(filename):
 // test purposes: remove printErr output, whose order is unpredictable when compared to print
 Module.printErr = Module['printErr'] = function(){};
 ''')
-      self.emcc_args += ['--post-js', 'glue.js', '--post-js', 'export.js']
+      self.emcc_args += ['-s', 'EXPORTED_FUNCTIONS=["_malloc"]', '--post-js', 'glue.js', '--post-js', 'export.js']
       shutil.copyfile(path_from_root('tests', 'webidl', 'test.h'), self.in_dir('test.h'))
       shutil.copyfile(path_from_root('tests', 'webidl', 'test.cpp'), self.in_dir('test.cpp'))
       src = open('test.cpp').read()
@@ -6838,8 +6664,8 @@ Module.printErr = Module['printErr'] = function(){};
     if Building.LLVM_OPTS: return self.skip('LLVM can optimize away the intermediate |x|')
 
     src = '''
-      #include<stdio.h>
-      #include<stdlib.h>
+      #include <stdio.h>
+      #include <stdlib.h>
       int main() { int *x = (int*)malloc(sizeof(int));
         *x = 20;
         float *y = (float*)x;
@@ -6860,8 +6686,8 @@ Module.printErr = Module['printErr'] = function(){};
     # Linking multiple files should work too
 
     module = '''
-      #include<stdio.h>
-      #include<stdlib.h>
+      #include <stdio.h>
+      #include <stdlib.h>
       void callFunc() { int *x = (int*)malloc(sizeof(int));
         *x = 20;
         float *y = (float*)x;
@@ -6872,8 +6698,8 @@ Module.printErr = Module['printErr'] = function(){};
     open(module_name, 'w').write(module)
 
     main = '''
-      #include<stdio.h>
-      #include<stdlib.h>
+      #include <stdio.h>
+      #include <stdlib.h>
       extern void callFunc();
       int main() { callFunc();
         int *x = (int*)malloc(sizeof(int));
@@ -6898,8 +6724,8 @@ Module.printErr = Module['printErr'] = function(){};
       # This test *should* fail, by throwing this exception
       assert 'Assertion failed: Load-store consistency assumption failure!' in str(e), str(e)
 
+  @no_emterpreter
   def test_source_map(self):
-    if self.is_emterpreter(): return self.skip('todo')
     if NODE_JS not in JS_ENGINES: return self.skip('sourcemapper requires Node to run')
     if '-g' not in Building.COMPILER_TEST_OPTS: Building.COMPILER_TEST_OPTS.append('-g')
 
@@ -6977,8 +6803,9 @@ Module.printErr = Module['printErr'] = function(){};
         else:
           os.environ.pop('EMCC_DEBUG', None)
 
+  @no_emterpreter
   def test_exception_source_map(self):
-    if self.is_emterpreter(): return self.skip('todo')
+    if self.is_wasm(): return self.skip('wasmifying destroys debug info and stack tracability')
     if '-g4' not in Building.COMPILER_TEST_OPTS: Building.COMPILER_TEST_OPTS.append('-g4')
     if NODE_JS not in JS_ENGINES: return self.skip('sourcemapper requires Node to run')
 
@@ -7018,18 +6845,40 @@ Module.printErr = Module['printErr'] = function(){};
     self.build(src, dirname, os.path.join(dirname, 'src.cpp'), post_build=(None, post))
 
   def test_emscripten_log(self):
+    if self.is_wasm(): return self.skip('wasmifying destroys debug info and stack tracability')
+    self.banned_js_engines = [V8_ENGINE] # v8 doesn't support console.log
+    self.emcc_args += ['-s', 'DEMANGLE_SUPPORT=1']
     if self.is_emterpreter():
       self.emcc_args += ['--profiling-funcs'] # without this, stack traces are not useful (we jump emterpret=>emterpret)
       Building.COMPILER_TEST_OPTS += ['-DEMTERPRETER'] # even so, we get extra emterpret() calls on the stack
     if Settings.ASM_JS:
       # XXX Does not work in SpiderMonkey since callstacks cannot be captured when running in asm.js, see https://bugzilla.mozilla.org/show_bug.cgi?id=947996
-      self.banned_js_engines = [SPIDERMONKEY_ENGINE] 
+      self.banned_js_engines += [SPIDERMONKEY_ENGINE] 
     if '-g' not in Building.COMPILER_TEST_OPTS: Building.COMPILER_TEST_OPTS.append('-g')
     Building.COMPILER_TEST_OPTS += ['-DRUN_FROM_JS_SHELL']
-    self.do_run(open(path_from_root('tests', 'emscripten_log', 'emscripten_log.cpp')).read(), "Success!")
+    self.do_run(open(path_from_root('tests', 'emscripten_log', 'emscripten_log.cpp')).read(), '''test print 123
+
+12.345679 9.123457 1.353180
+
+12345678 9123456 1353179
+
+12.345679 9123456 1353179
+
+12345678 9.123457 1353179
+
+12345678 9123456 1.353180
+
+12345678 9.123457 1.353180
+
+12.345679 9123456 1.353180
+
+12.345679 9.123457 1353179
+
+Success!
+''')
 
   def test_float_literals(self):
-    self.do_run_from_file(path_from_root('tests', 'test_float_literals.cpp'), path_from_root('tests', 'test_float_literals.out'))
+    self.do_run_in_out_file_test('tests', 'test_float_literals')
 
   def test_exit_status(self):
     src = r'''
@@ -7042,7 +6891,12 @@ Module.printErr = Module['printErr'] = function(){};
       int main() {
         atexit(cleanup); // this atexit should still be called
         printf("hello, world!\n");
-        exit(118); // Unusual exit status to make sure it's working!
+        // Unusual exit status to make sure it's working!
+        if (CAPITAL_EXIT) {
+          _Exit(118);
+        } else {
+          exit(118);
+        }
       }
     '''
     open('post.js', 'w').write('''
@@ -7052,7 +6906,8 @@ Module.printErr = Module['printErr'] = function(){};
       Module.callMain();
     ''')
     self.emcc_args += ['-s', 'INVOKE_RUN=0', '--post-js', 'post.js']
-    self.do_run(src, 'hello, world!\ncleanup\nI see exit status: 118')
+    self.do_run(src.replace('CAPITAL_EXIT', '0'), 'hello, world!\ncleanup\nI see exit status: 118')
+    self.do_run(src.replace('CAPITAL_EXIT', '1'), 'hello, world!\ncleanup\nI see exit status: 118')
 
   def test_noexitruntime(self):
     src = r'''
@@ -7079,27 +6934,6 @@ Module.printErr = Module['printErr'] = function(){};
 
   def test_locale(self):
     self.do_run_from_file(path_from_root('tests', 'test_locale.c'), path_from_root('tests', 'test_locale.out'))
-
-  def test_sixtyfour_bit_return_value(self):
-    # This test checks that the most significant 32 bits of a 64 bit long are correctly made available
-    # to native JavaScript applications that wish to interact with compiled code returning 64 bit longs.
-    # The MS 32 bits should be available in Runtime.getTempRet0() even when compiled with -O2 --closure 1
-
-    # Compile test.c and wrap it in a native JavaScript binding so we can call our compiled function from JS.
-    Popen([PYTHON, EMCC, path_from_root('tests', 'return64bit', 'test.c'), '--pre-js', path_from_root('tests', 'return64bit', 'testbindstart.js'), '--pre-js', path_from_root('tests', 'return64bit', 'testbind.js'), '--post-js', path_from_root('tests', 'return64bit', 'testbindend.js'), '-s', 'EXPORTED_FUNCTIONS=["_test"]', '-o', 'test.js', '-O2', '--closure', '1'], stdout=PIPE, stderr=PIPE).communicate()
-
-    # Simple test program to load the test.js binding library and call the binding to the
-    # C function returning the 64 bit long.
-    open(os.path.join(self.get_dir(), 'testrun.js'), 'w').write('''
-      var test = require("./test.js");
-      test.runtest();
-    ''')
-
-    # Run the test and confirm the output is as expected.
-    if NODE_JS in JS_ENGINES:
-      out = run_js('testrun.js', engine=NODE_JS, full_output=True)
-      assert "low = 5678" in out
-      assert "high = 1234" in out
 
   def test_async(self):
     self.banned_js_engines = [SPIDERMONKEY_ENGINE, V8_ENGINE] # needs setTimeout which only node has
@@ -7332,7 +7166,7 @@ int main(int argc, char **argv) {
               typeof STACK_MAX === 'number' &&
               typeof STACKTOP === 'number' &&
               typeof DYNAMIC_BASE === 'number' &&
-              typeof DYNAMICTOP === 'number') {
+              typeof DYNAMICTOP_PTR === 'number') {
              Module.print('able to run memprof');
            } else {
              Module.print('missing the required variables to run memprof');
@@ -7342,6 +7176,51 @@ int main(int argc, char **argv) {
     ''')
     self.emcc_args += ['--js-library', os.path.join(self.get_dir(), 'lib.js')]
     self.do_run(open(os.path.join(self.get_dir(), 'main.cpp'), 'r').read(), 'able to run memprof')
+
+  def test_fs_dict(self):
+      Settings.FORCE_FILESYSTEM = 1
+      open(self.in_dir('pre.js'), 'w').write('''
+        var Module = {};
+        Module['preRun'] = function() {
+            Module.print(typeof FS.filesystems['MEMFS']);
+            Module.print(typeof FS.filesystems['IDBFS']);
+            Module.print(typeof FS.filesystems['NODEFS']);
+        };
+      ''')
+      self.emcc_args += ['--pre-js', 'pre.js']
+      self.do_run('', 'object\nobject\nobject')
+
+  @no_wasm_backend("wasm backend has no support for fastcomp's -emscripten-assertions flag")
+  def test_stack_overflow_check(self):
+    args = self.emcc_args + ['-s', 'TOTAL_STACK=1048576']
+    self.emcc_args = args + ['-s', 'STACK_OVERFLOW_CHECK=1', '-s', 'ASSERTIONS=0']
+    self.do_run(open(path_from_root('tests', 'stack_overflow.cpp'), 'r').read(), 'Stack overflow! Stack cookie has been overwritten' if not Settings.SAFE_HEAP else 'segmentation fault')
+
+    self.emcc_args = args + ['-s', 'STACK_OVERFLOW_CHECK=2', '-s', 'ASSERTIONS=0']
+    self.do_run(open(path_from_root('tests', 'stack_overflow.cpp'), 'r').read(), 'Stack overflow! Attempted to allocate')
+
+    self.emcc_args = args + ['-s', 'ASSERTIONS=1']
+    self.do_run(open(path_from_root('tests', 'stack_overflow.cpp'), 'r').read(), 'Stack overflow! Attempted to allocate')
+
+  @no_wasm
+  def test_binaryen(self):
+    self.emcc_args += ['-s', 'BINARYEN=1', '-s', 'BINARYEN_METHOD="interpret-binary"']
+    self.do_run(open(path_from_root('tests', 'hello_world.c')).read(), 'hello, world!')
+
+  def test_sbrk(self):
+    self.do_run(open(path_from_root('tests', 'sbrk_brk.cpp')).read(), 'OK.')
+
+  def test_brk(self):
+    self.emcc_args += ['-DTEST_BRK=1']
+    self.do_run(open(path_from_root('tests', 'sbrk_brk.cpp')).read(), 'OK.')
+
+  # Tests that we can use the dlmalloc mallinfo() function to obtain information about malloc()ed blocks and compute how much memory is used/freed.
+  @no_wasm_backend('requires EM_ASM args support in wasm backend')
+  def test_mallinfo(self):
+    self.do_run(open(path_from_root('tests', 'mallinfo.cpp')).read(), 'OK.')
+
+  def test_wrap_malloc(self):
+    self.do_run(open(path_from_root('tests', 'wrap_malloc.cpp')).read(), 'OK.')
 
 # Generate tests for everything
 def make_run(fullname, name=-1, compiler=-1, embetter=0, quantum_size=0,
@@ -7377,7 +7256,6 @@ def make_run(fullname, name=-1, compiler=-1, embetter=0, quantum_size=0,
       check_sanity(force=True)
       checked_sanity = True
 
-    Building.COMPILER_TEST_OPTS = ['-g']
     os.chdir(self.get_dir()) # Ensure the directory exists and go there
     Building.COMPILER = compiler
 
@@ -7385,9 +7263,9 @@ def make_run(fullname, name=-1, compiler=-1, embetter=0, quantum_size=0,
     self.emcc_args = emcc_args[:]
     Settings.load(self.emcc_args)
     Building.LLVM_OPTS = 0
-    if '-O2' in self.emcc_args or '-O3' in self.emcc_args:
-      Building.COMPILER_TEST_OPTS = [] # remove -g in -O2 tests, for more coverage
-    #Building.COMPILER_TEST_OPTS += self.emcc_args
+
+    Building.COMPILER_TEST_OPTS += ['-Wno-dynamic-class-memaccess', '-Wno-format', '-Wno-format-extra-args', '-Wno-format-security', '-Wno-pointer-bool-conversion', '-Wno-unused-volatile-lvalue', '-Wno-c++11-compat-deprecated-writable-strings', '-Wno-invalid-pp-token']
+
     for arg in self.emcc_args:
       if arg.startswith('-O'):
         Building.COMPILER_TEST_OPTS.append(arg) # so bitcode is optimized too, this is for cpp to ll
@@ -7410,12 +7288,25 @@ asm2 = make_run("asm2", compiler=CLANG, emcc_args=["-O2"])
 asm3 = make_run("asm3", compiler=CLANG, emcc_args=["-O3"])
 asm2f = make_run("asm2f", compiler=CLANG, emcc_args=["-Oz", "-s", "PRECISE_F32=1", "-s", "ALLOW_MEMORY_GROWTH=1"])
 asm2g = make_run("asm2g", compiler=CLANG, emcc_args=["-O2", "-g", "-s", "ASSERTIONS=1", "-s", "SAFE_HEAP=1"])
-asm1i = make_run("asm1i", compiler=CLANG, emcc_args=["-O1", '-s', 'EMTERPRETIFY=1'])
-asm3i = make_run("asm3i", compiler=CLANG, emcc_args=["-O3", '-s', 'EMTERPRETIFY=1'])
-asm2m = make_run("asm2m", compiler=CLANG, emcc_args=["-O2", "--memory-init-file", "0", "-s", "MEM_INIT_METHOD=2", "-s", "ASSERTIONS=1"])
+asm2i = make_run("asm2i", compiler=CLANG, emcc_args=["-O2", '-s', 'EMTERPRETIFY=1'])
+#asm2m = make_run("asm2m", compiler=CLANG, emcc_args=["-O2", "--memory-init-file", "0", "-s", "MEM_INIT_METHOD=2", "-s", "ASSERTIONS=1"])
+
+binaryen0 = make_run("binaryen0", compiler=CLANG, emcc_args=['-O0', '-s', 'BINARYEN=1', '-s', 'BINARYEN_METHOD="native-wasm"'])
+binaryen1 = make_run("binaryen1", compiler=CLANG, emcc_args=['-O1', '-s', 'BINARYEN=1', '-s', 'BINARYEN_METHOD="native-wasm"'])
+binaryen2 = make_run("binaryen2", compiler=CLANG, emcc_args=['-O2', '-s', 'BINARYEN=1', '-s', 'BINARYEN_METHOD="native-wasm"'])
+binaryen3 = make_run("binaryen3", compiler=CLANG, emcc_args=['-O3', '-s', 'BINARYEN=1', '-s', 'BINARYEN_METHOD="native-wasm"', '-s', 'ASSERTIONS=1', "-s", "PRECISE_F32=1"])
+
+binaryen2jo = make_run("binaryen2jo", compiler=CLANG, emcc_args=['-O2', '-s', 'BINARYEN=1', '-s', 'BINARYEN_METHOD="native-wasm,asmjs"'])
+binaryen3jo = make_run("binaryen3jo", compiler=CLANG, emcc_args=['-O3', '-s', 'BINARYEN=1', '-s', 'BINARYEN_METHOD="native-wasm,asmjs"'])
+
+# This tests the binaryen interpreter and its polyfill integration in the emscripten JS glue
+binaryen2_interpret = make_run("binaryen2_interpret", compiler=CLANG, emcc_args=['-O2', '-s', 'BINARYEN=1', '-s', 'BINARYEN_METHOD="interpret-binary"'])
+
+
+#normalyen = make_run("normalyen", compiler=CLANG, emcc_args=['-O0', '-s', 'GLOBAL_BASE=1024']) # useful comparison to binaryen
+#spidaryen = make_run("binaryen", compiler=CLANG, emcc_args=['-O0', '-s', 'BINARYEN=1', '-s', 'BINARYEN_SCRIPTS="spidermonkify.py"'])
 
 # Legacy test modes - 
 asm2nn = make_run("asm2nn", compiler=CLANG, emcc_args=["-O2"], env={"EMCC_NATIVE_OPTIMIZER": "0"})
 
 del T # T is just a shape for the specific subclasses, we don't test it itself
-

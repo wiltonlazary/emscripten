@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <stdlib.h>
 
 // Part 1
 
@@ -13,6 +14,7 @@ public:
   void parentFunc() {}
   const Parent *getAsConst() { return NULL; }
   void *voidStar(void *something) { return something; }
+  bool getBoolean() { return true; }
 
   const int immutableAttr;
 };
@@ -54,6 +56,7 @@ class StringUser {
   int i;
 public:
   StringUser(char *string="NO", int integer=99) : s(strdup(string)), i(integer) {}
+  ~StringUser() { free(s); }
   void Print(int anotherInteger, char *anotherString) {
     printf("|%s|%d|%s|%d|\n", s, i, anotherString, anotherInteger);
   }
@@ -82,6 +85,7 @@ namespace Space {
     Inner() {}
     int get() { return 198; }
     Inner& operator*=(float x) { return *this; }
+    int operator[](int x) { return x*2; }
   };
 }
 
@@ -117,7 +121,7 @@ class TypeTestClass {
   unsigned short int ReturnUnsignedShortMethod() { return (2<<15)-1; }
   void AcceptUnsignedShortMethod(unsigned short x) { printf("unsigned short int: %u\n", x); }
 
-  unsigned long ReturnUnsignedLongMethod() { return (2<<31)-1; }
+  unsigned long ReturnUnsignedLongMethod() { return 0xffffffff; }
   void AcceptUnsignedLongMethod(unsigned long x) { printf("unsigned long int: %u\n", x); }
 };
 
@@ -141,3 +145,12 @@ class ArrayClass {
   StructInArray struct_array[8];
   StructInArray* struct_ptr_array[8];
 };
+
+struct ReceiveArrays {
+  void giveMeArrays(float* vertices, int* triangles, int num) {
+    for (int i = 0; i < num; i++) {
+      printf("%d : %.2f\n", triangles[i], vertices[i]);
+    }
+  }
+};
+

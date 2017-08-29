@@ -11,6 +11,10 @@
 // mode. See apply_opt_level in tools/shared.py for how -O1,2,3 affect these
 // flags.
 //
+// These flags should only have an effect when compiling to JS, so there
+// should not be a need to have them when just compiling source to
+// bitcode. However, there will also be no harm either, so it is ok to.
+//
 
 // Tuning
 var QUANTUM_SIZE = 4; // This is the size of an individual field in a structure. 1 would
@@ -28,6 +32,11 @@ var ASSERTIONS = 1; // Whether we should add runtime assertions, for example to
                     // of positive size, etc., whether we should throw if we encounter a bad __label__, i.e.,
                     // if code flow runs into a fault
                     // ASSERTIONS == 2 gives even more runtime checks
+var STACK_OVERFLOW_CHECK = 0; // Chooses what kind of stack smash checks to emit to generated code:
+                              // 0: Stack overflows are not checked.
+                              // 1: Adds a security cookie at the top of the stack, which is checked at end of each tick and at exit (practically zero performance overhead)
+                              // 2: Same as above, but also adds an explicit check for allocate() calls which call ALLOC_STACK. Has a small performance cost.
+                              //    -s ASSERTIONS=1 automatically enables -s STACK_OVERFLOW_CHECK=2.
 var VERBOSE = 0; // When set to 1, will generate more verbose output during compilation.
 
 var INVOKE_RUN = 1; // Whether we will run the main() function. Disable if you embed the generated
@@ -40,6 +49,7 @@ var MEM_INIT_METHOD = 0; // How to represent the initial memory content.
                          // 1: create a *.mem file containing the binary data of the initial memory;
                          //    use the --memory-init-file command line switch to select this method
                          // 2: embed a string literal representing that initial memory data
+                         //    XXX this is known to have bugs on windows, see https://github.com/kripken/emscripten/pull/3326
 var TOTAL_STACK = 5*1024*1024; // The total stack size. There is no way to enlarge the stack, so this
                                // value must be large enough for the program's requirements. If
                                // assertions are on, we will assert on not exceeding this, otherwise,
@@ -47,6 +57,13 @@ var TOTAL_STACK = 5*1024*1024; // The total stack size. There is no way to enlar
 var TOTAL_MEMORY = 16777216;     // The total amount of memory to use. Using more memory than this will
                                  // cause us to expand the heap, which can be costly with typed arrays:
                                  // we need to copy the old heap into a new one in that case.
+var ABORTING_MALLOC = 1; // If 1, then when malloc would fail we abort(). This is nonstandard behavior,
+                         // but makes sense for the web since we have a fixed amount of memory that
+                         // must all be allocated up front, and so (a) failing mallocs are much more
+                         // likely than on other platforms, and (b) people need a way to find out
+                         // how big that initial allocation (TOTAL_MEMORY) must be.
+                         // If you set this to 0, then you get the standard malloc behavior of
+                         // returning NULL (0) when it fails.
 var ALLOW_MEMORY_GROWTH = 0; // If false, we abort with an error if we try to allocate more memory than
                              // we can (TOTAL_MEMORY). If true, we will grow the memory arrays at
                              // runtime, seamlessly and dynamically. This has a performance cost though,
@@ -55,17 +72,22 @@ var ALLOW_MEMORY_GROWTH = 0; // If false, we abort with an error if we try to al
                              // eliminator).
                              // See https://code.google.com/p/v8/issues/detail?id=3907 regarding
                              // memory growth performance in chrome.
+                             // Setting this option on will disable ABORTING_MALLOC, in other words,
+                             // ALLOW_MEMORY_GROWTH enables fully standard behavior, of both malloc
+                             // returning 0 when it fails, and also of being able to allocate more
+                             // memory from the system as necessary.
 
 var GLOBAL_BASE = -1; // where global data begins; the start of static memory. -1 means use the
                       // default, any other value will be used as an override
+var STACK_START = -1; // where the stack will begin. -1 means use the default. if the stack cannot
+                      // start at the value specified here, it may start at a higher location.
+                      // this is useful when debugging two builds that may differ in their static
+                      // allocations, by forcing the stack to start in the same place their
+                      // memory usage patterns would be the same.
 
 // Code embetterments
-var USE_TYPED_ARRAYS = 2; // Use typed arrays for the heap. See https://github.com/kripken/emscripten/wiki/Code-Generation-Modes/
-                          // 2 is a single heap, accessible through views as int8, int32, etc. This is
-                          //   the only supported mode.
 var DOUBLE_MODE = 1; // How to load and store 64-bit doubles.
                      // A potential risk is that doubles may be only 32-bit aligned. Forcing 64-bit alignment
-                     // a potential risk is that doubles may be only 32-bit aligned. Forcing 64-bit alignment
                      // in Clang itself should be able to solve that, or as a workaround in DOUBLE_MODE 1 we
                      // will carefully load in parts, in a way that requires only 32-bit alignment. In DOUBLE_MODE
                      // 0 we will simply store and load doubles as 32-bit floats, so when they are stored/loaded
@@ -86,7 +108,7 @@ var FORCE_ALIGNED_MEMORY = 0; // If enabled, assumes all reads and writes are fu
                               // smaller and faster code, or even the option to turn this flag on.
 var WARN_UNALIGNED = 0; // Warn at compile time about instructions that LLVM tells us are not fully aligned.
                         // This is useful to find places in your code where you might refactor to ensure proper
-                        // alignment. (this option is fastcomp-only)
+                        // alignment.
 var PRECISE_I64_MATH = 1; // If enabled, i64 addition etc. is emulated - which is slow but precise. If disabled,
                           // we use the 'double trick' which is fast but incurs rounding at high values.
                           // If set to 2, we always include the i64 math code, which is necessary in the case
@@ -116,10 +138,8 @@ var SIMD = 0; // Whether to allow autovectorized SIMD code ( https://github.com/
               // also want the autovectorizer to run.
               // Note that SIMD support in browsers is not yet there (as of Sep 2, 2014), so you will be
               // running in a polyfill, which is not fast.
-              // (In older versions of emscripten, in particular pre-fastcomp, SIMD=1 was needed to get
-              // any SIMD output at all.)
 
-var CLOSURE_COMPILER = 0; // Whether closure compiling is being run on this output
+var USE_CLOSURE_COMPILER = 0; // Whether closure compiling is being run on this output
 
 var SKIP_STACK_IN_SMALL = 1; // When enabled, does not push/pop the stack at all in
                              // functions that have no basic stack usage. But, they
@@ -159,7 +179,7 @@ var SIMPLIFY_IFS = 1; // Whether to simplify ifs in js-optimizer.js
 
 // Generated code debugging options
 var SAFE_HEAP = 0; // Check each write to the heap, for example, this will give a clear
-                   // error on what would be segfaults in a native build (like deferencing
+                   // error on what would be segfaults in a native build (like dereferencing
                    // 0). See preamble.js for the actual checks performed.
 var SAFE_HEAP_LOG = 0; // Log out all SAFE_HEAP operations
 
@@ -175,6 +195,16 @@ var EMULATED_FUNCTION_POINTERS = 0; // By default we implement function pointers
                                     // function tables, which is very fast. With this option,
                                     // we implement them more flexibly by emulating them: we
                                     // call out into JS, which handles the function tables.
+                                    //  1: Full emulation. This means you can modify the
+                                    //     table in JS fully dynamically, not just add to
+                                    //     the end.
+                                    //  2: Optimized emulation. Assumes once something is
+                                    //     added to the table, it will not change. This allows
+                                    //     dynamic linking while keeping performance fast,
+                                    //     as we can do a fast call into the internal table
+                                    //     if the fp is in the right range. Shared modules
+                                    //     (MAIN_MODULE, SIDE_MODULE) do this by default.
+                                    //     This requires RELOCATABLE to be set.
 var EMULATE_FUNCTION_POINTER_CASTS = 0; // Allows function pointers to be cast, wraps each
                                         // call of an incorrect type with a runtime correction.
                                         // This adds overhead and should not be used normally.
@@ -195,6 +225,7 @@ var LIBRARY_DEBUG = 0; // Print out when we enter a library call (library*.js). 
                        // Runtime.debug at runtime for logging to cease, and can set it when you
                        // want it back. A simple way to set it in C++ is
                        //   emscripten_run_script("Runtime.debug = ...;");
+var SYSCALL_DEBUG = 0; // Print out all syscalls
 var SOCKET_DEBUG = 0; // Log out socket/network data transfer.
 var SOCKET_WEBRTC = 0; // Select socket backend, either webrtc or websockets. XXX webrtc is not currently tested, may be broken
 
@@ -227,7 +258,7 @@ var LEGACY_GL_EMULATION = 0; // Includes code to emulate various desktop GL feat
                              // in some cases, see http://kripken.github.io/emscripten-site/docs/porting/multimedia_and_graphics/OpenGL-support.html
 var GL_FFP_ONLY = 0; // If you specified LEGACY_GL_EMULATION = 1 and only use fixed function pipeline in your code,
                      // you can also set this to 1 to signal the GL emulation layer that it can perform extra
-                     // optimizations by knowing that the user code does not use shaders at all. If 
+                     // optimizations by knowing that the user code does not use shaders at all. If
                      // LEGACY_GL_EMULATION = 0, this setting has no effect.
 
 var STB_IMAGE = 0; // Enables building of stb-image, a tiny public-domain library for decoding images, allowing
@@ -235,6 +266,18 @@ var STB_IMAGE = 0; // Enables building of stb-image, a tiny public-domain librar
                    // can be done synchronously, however, it will not be as fast as the browser itself.
                    // When enabled, stb-image will be used automatically from IMG_Load and IMG_Load_RW. You
                    // can also call the stbi_* functions directly yourself.
+
+var LZ4 = 0; // Enable this to support lz4-compressed file packages. They are stored compressed in memory, and
+             // decompressed on the fly, avoiding storing the entire decompressed data in memory at once.
+             // If you run the file packager separately, you still need to build the main program with this flag,
+             // and also pass --lz4 to the file packager.
+             // (You can also manually compress one on the client, using LZ4.loadPackage(), but that is less
+             // recommended.)
+             // Limitations:
+             //   * LZ4-compressed files are only decompressed when needed, so they are not available
+             //     for special preloading operations like pre-decoding of images using browser codecs,
+             //     preloadPlugin stuff, etc.
+             //   * LZ4 files are read-only.
 
 var DISABLE_EXCEPTION_CATCHING = 0; // Disables generating code to actually catch exceptions. If the code you
                                     // are compiling does not actually rely on catching exceptions (but the
@@ -252,6 +295,11 @@ var DISABLE_EXCEPTION_CATCHING = 0; // Disables generating code to actually catc
 var EXCEPTION_CATCHING_WHITELIST = [];  // Enables catching exception in the listed functions only, if
                                         // DISABLE_EXCEPTION_CATCHING = 2 is set
 
+var NODEJS_CATCH_EXIT = 1; // By default we handle exit() in node, by catching the Exit exception. However,
+                           // this means we catch all process exceptions. If you disable this, then we no
+                           // longer do that, and exceptions work normally, which can be useful for libraries
+                           // or programs that don't need exit() to work.
+
 // For more explanations of this option, please visit
 // https://github.com/kripken/emscripten/wiki/Asyncify
 var ASYNCIFY = 0; // Whether to enable asyncify transformation
@@ -261,19 +309,73 @@ var ASYNCIFY_FUNCTIONS = ['emscripten_sleep', // Functions that call any functio
                           'emscripten_wget',  // will be transformed
                           'emscripten_yield'];
 var ASYNCIFY_WHITELIST = ['qsort',   // Functions in this list are never considered async, even if they appear in ASYNCIFY_FUNCTIONS
-                          'trinkle', // In the asyncify transformation, any function that calls a function pointer is considered async 
+                          'trinkle', // In the asyncify transformation, any function that calls a function pointer is considered async
                           '__toread', // This whitelist is useful when a function is known to be sync
                           '__uflow',  // currently this link contains some functions in libc
-                          '__fwritex', 
-                          'MUSL_vfprintf']; 
-                                                                                                    
+                          '__fwritex',
+                          'MUSL_vfprintf'];
+
+var EXPORTED_RUNTIME_METHODS = [ // Runtime elements that are exported on Module. By default we export quite a bit, you can reduce this list to lower your code size,
+                                 // especially when closure is run (exporting prevents closure from eliminating code)
+                                 // Note that methods on this list are only exported if they are included (either automatically from linking, or due to being
+                                 // in DEFAULT_LIBRARY_FUNCS_TO_INCLUDE)
+                                 // Note that the name may be slightly misleading, as this
+                                 // is for any JS library element, and not just
+                                 // methods. For example, we export the Runtime object
+                                 // by having "Runtime" in this list.
+  'FS_createFolder',
+  'FS_createPath',
+  'FS_createDataFile',
+  'FS_createPreloadedFile',
+  'FS_createLazyFile',
+  'FS_createLink',
+  'FS_createDevice',
+  'FS_unlink',
+  'Runtime',
+  'ccall',
+  'cwrap',
+  'setValue',
+  'getValue',
+  'ALLOC_NORMAL',
+  'ALLOC_STACK',
+  'ALLOC_STATIC',
+  'ALLOC_DYNAMIC',
+  'ALLOC_NONE',
+  'allocate',
+  'getMemory',
+  'Pointer_stringify',
+  'AsciiToString',
+  'stringToAscii',
+  'UTF8ArrayToString',
+  'UTF8ToString',
+  'stringToUTF8Array',
+  'stringToUTF8',
+  'lengthBytesUTF8',
+  'stackTrace',
+  'addOnPreRun',
+  'addOnInit',
+  'addOnPreMain',
+  'addOnExit',
+  'addOnPostRun',
+  'intArrayFromString',
+  'intArrayToString',
+  'writeStringToMemory',
+  'writeArrayToMemory',
+  'writeAsciiToMemory',
+  'addRunDependency',
+  'removeRunDependency',
+];
+
+var EXTRA_EXPORTED_RUNTIME_METHODS = []; // Additional methods to those in EXPORTED_RUNTIME_METHODS. Adjusting that list
+                                         // lets you remove methods that would be exported by default; setting values in
+                                         // this list lets you add to the default list without modifying it.
 
 var FS_LOG = 0; // Log all FS operations.  This is especially helpful when you're porting
                 // a new project and want to see a list of file system operations happening
                 // so that you can create a virtual file system with all of the required files.
 var CASE_INSENSITIVE_FS = 0; // If set to nonzero, the provided virtual filesystem if treated case-insensitive, like
                              // Windows and OSX do. If set to 0, the VFS is case-sensitive, like on Linux.
-var MEMFS_APPEND_TO_TYPED_ARRAYS = 0; // If set to nonzero, MEMFS will always utilize typed arrays as the backing store 
+var MEMFS_APPEND_TO_TYPED_ARRAYS = 0; // If set to nonzero, MEMFS will always utilize typed arrays as the backing store
                                       // for appending data to files. The default behavior is to use typed arrays for files
                                       // when the file size doesn't change after initial creation, and for files that do
                                       // change size, use normal JS arrays instead.
@@ -281,14 +383,14 @@ var NO_FILESYSTEM = 0; // If set, does not build in any filesystem support. Usef
                        // computation, but not reading files or using any streams (including fprintf, and other
                        // stdio.h things) or anything related. The one exception is there is partial support for printf,
                        // and puts, hackishly.
-var NO_BROWSER = 0; // If set, disables building in browser support using the Browser object. Useful if you are
-                    // just doing pure computation in a library, and don't need any browser capabilities like a main loop
-                    // (emscripten_set_main_loop), or setTimeout, etc.
+                       // The compiler will automatically set this if it detects that syscall usage (which is static)
+                       // does not require a full filesystem. If you still want filesystem support, use
+                       // FORCE_FILESYSTEM
+var FORCE_FILESYSTEM = 0; // Makes full filesystem support be included, even if statically it looks like it is not
+                          // used. For example, if your C code uses no files, but you include some JS that does,
+                          // you might need this.
 
-var NODE_STDOUT_FLUSH_WORKAROUND = 1; // Whether or not to work around node issues with not flushing stdout. This
-                                      // can cause unnecessary whitespace to be printed.
-
-var EXPORTED_FUNCTIONS = ['_main', '_malloc'];
+var EXPORTED_FUNCTIONS = ['_main'];
                                     // Functions that are explicitly exported. These functions are kept alive
                                     // through LLVM dead code elimination, and also made accessible outside of
                                     // the generated code even after running closure compiler (on "Module").
@@ -297,6 +399,7 @@ var EXPORTED_FUNCTIONS = ['_main', '_malloc'];
                                     // have a main() function and want it to run, you must include it in this
                                     // list (as _main is by default in this value, and if you override it
                                     // without keeping it there, you are in effect removing it).
+
 var EXPORT_ALL = 0; // If true, we export all the symbols. Note that this does *not* affect LLVM, so it can
                     // still eliminate functions as dead. This just exports them on the Module object.
 var EXPORT_BINDINGS = 0; // Export all bindings generator functions (prefixed with emscripten_bind_). This
@@ -315,14 +418,18 @@ var OPT_LEVEL = 0;           // this will contain the optimization level (-Ox). 
 var DEBUG_LEVEL = 0;         // this will contain the debug level (-gx). you should not modify it.
 
 
-// JS library functions (C functions implemented in JS)
+// JS library elements (C functions implemented in JS)
 // that we include by default. If you want to make sure
 // something is included by the JS compiler, add it here.
 // For example, if you do not use some emscripten_*
 // C API call from C, but you want to call it from JS,
 // add it here (and in EXPORTED FUNCTIONS with prefix
-// "_", for closure).
-var DEFAULT_LIBRARY_FUNCS_TO_INCLUDE = ['memcpy', 'memset', 'malloc', 'free', 'strlen', '$Browser'];
+// "_", if you use closure compiler).
+// Note that the name may be slightly misleading, as this
+// is for any JS library element, and not just
+// functions. For example, you can include the Browser
+// object by adding "$Browser" to this list.
+var DEFAULT_LIBRARY_FUNCS_TO_INCLUDE = ['memcpy', 'memset', 'malloc', 'free'];
 
 var LIBRARY_DEPS_TO_AUTOEXPORT = ['memcpy']; // This list is also used to determine
                                              // auto-exporting of library dependencies (i.e., functions that
@@ -330,18 +437,16 @@ var LIBRARY_DEPS_TO_AUTOEXPORT = ['memcpy']; // This list is also used to determ
                                              // so we must export so that if they are implemented in C
                                              // they will be accessible, in ASM_JS mode).
 
-var EXPORTED_GLOBALS = []; // Global non-function variables that are explicitly
-                           // exported, so they are guaranteed to be
-                           // accessible outside of the generated code.
-
-var INCLUDE_FULL_LIBRARY = 0; // Whether to include the whole library rather than just the
-                              // functions used by the generated code. This is needed when
-                              // dynamically loading modules that make use of runtime
+var INCLUDE_FULL_LIBRARY = 0; // Include all JS library functions instead of the sum of
+                              // DEFAULT_LIBRARY_FUNCS_TO_INCLUDE + any functions used
+                              // by the generated code. This is needed when dynamically
+                              // loading (i.e. dlopen) modules that make use of runtime
                               // library functions that are not used in the main module.
-                              // Note that this includes js libraries but *not* C. You will
-                              // need the main file to include all needed C libraries. For
-                              // example, if a library uses malloc or new, you will need
-                              // to use those in the main file too to link in dlmalloc.
+                              // Note that this only applies to js libraries, *not* C. You
+                              // will need the main file to include all needed C libraries.
+                              // For example, if a module uses malloc or new, you will
+                              // need to use those in the main file too to pull in dlmalloc
+                              // for use by the module.
 
 var SHELL_FILE = 0; // set this to a string to override the shell file used
 
@@ -350,6 +455,10 @@ var RELOCATABLE = 0; // If set to 1, we emit relocatable code from the LLVM back
 
 var MAIN_MODULE = 0; // A main module is a file compiled in a way that allows us to link it to
                      // a side module using emlink.py.
+                     //  1: Normal main module.
+                     //  2: DCE'd main module. We eliminate dead code normally. If a side
+                     //     module needs something from main, it is up to you to make sure
+                     //     it is kept alive.
 var SIDE_MODULE = 0; // Corresponds to MAIN_MODULE
 
 var RUNTIME_LINKED_LIBS = []; // If this is a main module (MAIN_MODULE == 1), then
@@ -378,6 +487,10 @@ var LINKABLE = 0; // If set to 1, this file can be linked with others, either as
                   // LINKABLE of 0 is very useful in that we can reduce the size of the
                   // generated code very significantly, by removing everything not actually used.
 
+var STRICT = 0;   // Emscripten 'strict' build mode: Drop supporting any deprecated build options.
+                  // Set the environment variable EMCC_STRICT=1 or pass -s STRICT=1
+                  // to test that a codebase builds nicely in forward compatible manner.
+
 var WARN_ON_UNDEFINED_SYMBOLS = 1; // If set to 1, we will warn on any undefined symbols that
                                    // are not resolved by the library_*.js files. Note that
                                    // it is common in large projects to
@@ -391,6 +504,22 @@ var WARN_ON_UNDEFINED_SYMBOLS = 1; // If set to 1, we will warn on any undefined
 
 var ERROR_ON_UNDEFINED_SYMBOLS = 0; // If set to 1, we will give a compile-time error on any
                                     // undefined symbols (see WARN_ON_UNDEFINED_SYMBOLS).
+
+                                    // The default value for this is currently 0, but will be
+                                    // transitioned to 1 in the future. To keep relying on
+                                    // building with -s ERROR_ON_UNDEFINED_SYMBOLS=0 setting,
+                                    // prefer to set that option explicitly in your build system.
+
+var ERROR_ON_MISSING_LIBRARIES = 0; // If set to 1, any -lfoo directives pointing to nonexisting
+                                    // library files will issue a linker error.
+
+                                    // The default value for this is currently 0, but will be
+                                    // transitioned to 1 in the future. To keep relying on
+                                    // building with -s ERROR_ON_MISSING_LIBRARIES=0 setting,
+                                    // prefer to set that option explicitly in your build system.
+
+var SYSTEM_JS_LIBRARIES = []; // Specifies a list of Emscripten-provided JS libraries to link against.
+                              // (internal, use -lfoo or -lfoo.js to link to Emscripten system JS libraries)
 
 var SMALL_XHR_CHUNKS = 0; // Use small chunk size for binary synchronous XHR's in Web Workers.
                           // Used for testing.
@@ -429,6 +558,9 @@ var MODULARIZE = 0; // By default we emit all code in a straightforward way into
                     //
                     //   var instance = EXPORT_NAME({ option: value, ... });
                     //
+                    // Note the parentheses - we are calling EXPORT_NAME in order to instantiate
+                    // the module. (This allows, in particular, for you to create multiple
+                    // instantiations, etc.)
 
 var BENCHMARK = 0; // If 1, will just time how long main() takes to execute, and not
                    // print out anything at all whatsoever. This is useful for benchmarking.
@@ -441,31 +573,62 @@ var FINALIZE_ASM_JS = 1; // If 1, will finalize the final emitted code, includin
 
 var SWAPPABLE_ASM_MODULE = 0; // If 1, then all exports from the asm.js module will be accessed
                               // indirectly, which allow the asm module to be swapped later.
+                              // Note: It is very important to build the two modules that
+                              // are to be swapped with the same optimizations and so forth,
+                              // as we depend on them being a drop-in replacement for each
+                              // other (same globals on the heap at the same locations, etc.)
+
+var SEPARATE_ASM = 0; // see emcc --separate-asm
+
+var ONLY_MY_CODE = 0; // This disables linking and other causes of adding extra code
+                      // automatically, and as a result, your output compiled code
+                      // (in the .asm.js file, if you emit with --separate-asm) will
+                      //  contain only the functions you provide.
 
 var PGO = 0; // Enables profile-guided optimization in the form of runtime checks for
              // which functions are actually called. Emits a list during shutdown that you
              // can pass to DEAD_FUNCTIONS (you can also emit the list manually by
              // calling PGOMonitor.dump());
-var DEAD_FUNCTIONS = []; // Functions on this list are not converted to JS, and calls to
+var DEAD_FUNCTIONS = []; // JS library functions on this list are not converted to JS, and calls to
                          // them are turned into abort()s. This is potentially useful for
                          // reducing code size.
                          // If a dead function is actually called, you will get a runtime
                          // error.
-                         // This can affect both functions in compiled code, and system
-                         // library functions (e.g., you can use this to kill printf).
-                         // TODO: options to lazily load such functions
+                         // TODO: make this work on compiled methods as well, perhaps by
+                         //       adding a JS optimizer pass?
 
 var EXPLICIT_ZEXT = 0; // If 1, generate an explicit conversion of zext i1 to i32, using ?:
 
 var EXPORT_NAME = 'Module'; // Global variable to export the module as for environments without a standardized module
                             // loading system (e.g. the browser and SM shell).
 
-var NO_DYNAMIC_EXECUTION = 0; // When enabled, we do not emit eval() and new Function(), which disables some functionality
+var NO_DYNAMIC_EXECUTION = 0; // When set to 1, we do not emit eval() and new Function(), which disables some functionality
                               // (causing runtime errors if attempted to be used), but allows the emitted code to be
-                              // acceptable in places that disallow dynamic code execution (chrome packaged app, non-
-                              // privileged firefox app, etc.)
+                              // acceptable in places that disallow dynamic code execution (chrome packaged app,
+                              // privileged firefox app, etc.). Pass this flag when developing an Emscripten application
+                              // that is targeting a privileged or a certified execution environment, see
+                              // Firefox Content Security Policy (CSP) webpage for details:
+                              // https://developer.mozilla.org/en-US/Apps/Build/Building_apps_for_Firefox_OS/CSP
+                              // When this flag is set, the following features (linker flags) are unavailable:
+                              //  --closure 1: When using closure compiler, eval() would be needed to locate the Module object.
+                              //  -s RELOCATABLE=1: the function Runtime.loadDynamicLibrary would need to eval().
+                              //  --bind: Embind would need to eval().
+                              // Additionally, the following Emscripten runtime functions are unavailable when
+                              // NO_DYNAMIC_EXECUTION=1 is set, and an attempt to call them will throw an exception:
+                              // - emscripten_run_script(),
+                              // - emscripten_run_script_int(),
+                              // - emscripten_run_script_string(),
+                              // - dlopen(),
+                              // - the functions ccall() and cwrap() are still available, but they are restricted to only
+                              //   being able to call functions that have been exported in the Module object in advance.
+                              // When set to -s NO_DYNAMIC_EXECUTION=2 flag is set, attempts to call to eval() are demoted
+                              // to warnings instead of throwing an exception.
 
 var EMTERPRETIFY = 0; // Runs tools/emterpretify on the compiler output
+var EMTERPRETIFY_FILE = ''; // If defined, a file to write bytecode to, otherwise the default is to embed it in text JS arrays (which is less efficient).
+                            // When emitting HTML, we automatically generate code to load this file and set it to Module.emterpreterFile. If you
+                            // emit JS, you need to make sure that Module.emterpreterFile contains an ArrayBuffer with the bytecode, when the code loads.
+                            // Note: You might need to quote twice in the shell, something like     -s 'EMTERPRETIFY_FILE="waka"'
 var EMTERPRETIFY_BLACKLIST = []; // Functions to not emterpret, that is, to run normally at full speed
 var EMTERPRETIFY_WHITELIST = []; // If this contains any functions, then only the functions in this list
                                  // are emterpreted (as if all the rest are blacklisted; this overrides the BLACKLIST)
@@ -474,6 +637,17 @@ var EMTERPRETIFY_ADVISE = 0; // Performs a static analysis to suggest which func
                              // appears they can be on the stack when a sync function is called in the EMTERPRETIFY_ASYNC option.
                              // After showing the suggested list, compilation will halt. You can apply the provided list as an
                              // emcc argument when compiling later.
+
+var SPLIT_MEMORY = 0; // If > 0, we split memory into chunks, of the size given in this parameter.
+                      //  * TOTAL_MEMORY becomes the maximum amount of memory, as chunks are allocated on
+                      //    demand. That means this achieves a result similar to ALLOW_MEMORY_GROWTH, but
+                      //    better since it can free chunks in the middle. You still to set
+                      //    ALLOW_MEMORY_GROWTH if you want memory to grow beyond the initial TOTAL_MEMORY
+                      //    target.
+                      //  * Larger SPLIT_MEMORY sizes are generally faster to run.
+                      // TODO: more docs
+                      // TODO: add malloc-split to embuilder
+var SAFE_SPLIT_MEMORY = 0; // Similar to SAFE_HEAP, but for SPLIT_MEMORY.
 
 var RUNNING_JS_OPTS = 0; // whether js opts will be run, after the main compiler
 var BOOTSTRAPPING_STRUCT_INFO = 0; // whether we are in the generate struct_info bootstrap phase
@@ -484,14 +658,51 @@ var USE_GLFW = 2; // Specify the GLFW version that is being linked against.
                   // Only relevant, if you are linking against the GLFW library.
                   // Valid options are 2 for GLFW2 and 3 for GLFW3.
 
+var BINARYEN = 0; // Whether to use [Binaryen](https://github.com/WebAssembly/binaryen) to
+                  // compile code to WebAssembly.
+                  // This will fetch the binaryen port and build it. (If, instead, you set
+                  // BINARYEN_ROOT in your ~/.emscripten file, then we use that instead
+                  // of the port, which can useful for local dev work on binaryen itself).
+var BINARYEN_METHOD = "native-wasm"; // How we should run WebAssembly code. By default, we run it natively.
+                                     // See binaryen's src/js/wasm.js-post.js for more details and options.
+var BINARYEN_SCRIPTS = ""; // An optional comma-separated list of script hooks to run after binaryen,
+                           // in binaryen's /scripts dir.
+var BINARYEN_IMPRECISE = 0; // Whether to apply imprecise/unsafe binaryen optimizations. If enabled,
+                            // code will run faster, but some types of undefined behavior might
+                            // trap in wasm.
+var BINARYEN_PASSES = ""; // A comma-separated list of passes to run in the binaryen optimizer,
+                          // for example, "dce,precompute,vacuum".
+                          // When set, this overrides the default passes we would normally run.
+var BINARYEN_MEM_MAX = -1; // Set the maximum size of memory in the wasm module (in bytes).
+                           // Without this, TOTAL_MEMORY is used (as it is used for the initial value),
+                           // or if memory growth is enabled, no limit is set. This overrides both of those.
+var BINARYEN_ROOT = ""; // Directory where we can find Binaryen. Will be automatically set for you,
+                        // but you can set it to override if you are a Binaryen developer.
+
+var WASM = 0; // Alias for BINARYEN, the two are identical. Both make us compile code to WebAssembly.
+
+var WASM_BACKEND = 0; // Whether to use the WebAssembly backend that is in development in LLVM.
+                      // This requires that BINARYEN be set, as we use Binaryen's s2wasm to
+                      // translate the backend output.
+                      // You should not set this yourself, instead set EMCC_WASM_BACKEND=1 in the
+                      // environment.
+
 // Ports
 
 var USE_SDL = 1; // Specify the SDL version that is being linked against.
                  // 1, the default, is 1.3, which is implemented in JS
                  // 2 is a port of the SDL C code on emscripten-ports
 var USE_SDL_IMAGE = 1; // Specify the SDL_image version that is being linked against. Must match USE_SDL
+var USE_SDL_TTF = 1; // Specify the SDL_ttf version that is being linked against. Must match USE_SDL
+var USE_SDL_NET = 1; // Specify the SDL_net version that is being linked against. Must match USE_SDL
 var USE_ZLIB = 0; // 1 = use zlib from emscripten-ports
 var USE_LIBPNG = 0; // 1 = use libpng from emscripten-ports
+var USE_BULLET = 0; // 1 = use bullet from emscripten-ports
+var USE_VORBIS = 0; // 1 = use vorbis from emscripten-ports
+var USE_OGG = 0; // 1 = use ogg from emscripten-ports
+var USE_FREETYPE = 0; // 1 = use freetype from emscripten-ports
+
+var SDL2_IMAGE_FORMATS = []; // Formats to support in SDL2_image. Valid values: bmp, gif, lbm, pcx, png, pnm, tga, xcf, xpm, xv
 
 
 // Compiler debugging options
@@ -524,5 +735,68 @@ var PTHREAD_POOL_SIZE = 0; // Specifies the number of web workers that are preal
 // if navigator.hardwareConcurrency is not supported. Pass in a negative number
 // to show a popup dialog at startup so the user can configure this dynamically.
 var PTHREAD_HINT_NUM_CORES = 4;
+
+var PTHREADS_PROFILING = 0; // True when building with --threadprofiler
+
+var MAX_GLOBAL_ALIGN = -1; // received from the backend
+
+// Duplicate function elimination. This coalesces function bodies that are
+// identical, which can happen e.g. if two methods have different C/C++
+// or LLVM types, but end up identical at the asm.js level (all pointers
+// are the same as int32_t in asm.js, for example).
+// This option is quite slow to run, as it processes and hashes all methods
+// in the codebase in multiple passes.
+var ELIMINATE_DUPLICATE_FUNCTIONS = 0; // disabled by default
+var ELIMINATE_DUPLICATE_FUNCTIONS_PASSES = 5;
+var ELIMINATE_DUPLICATE_FUNCTIONS_DUMP_EQUIVALENT_FUNCTIONS = 0;
+
+var EVAL_CTORS = 0; // This tries to evaluate global ctors at compile-time, applying their
+                    // effects into the mem init file. This saves running code during
+                    // startup, and also allows removing the global ctor functions and
+                    // other code that only they used, so this is also good for reducing
+                    // code size. However, this does make the compile step much slower.
+                    //
+                    // This basically runs the ctors during compile time, seeing if they
+                    // execute safely in a sandbox. Any ffi access out of asm.js causes
+                    // failure, as it could do something nondeterministic and/or
+                    // alter some other state we don't see. If all the global ctor does
+                    // is pure computation inside asm.js, it should be ok. Run with
+                    // EMCC_DEBUG=1 in the env to see logging, and errors when it
+                    // fails to eval (you'll see a message, or a stack trace; in the
+                    // latter case, the functions on the stack should give you an idea
+                    // of what ffi was called and why, and perhaps you can refactor
+                    // your code to avoid it, e.g., remove mallocs, printfs in global ctors).
+                    //
+                    // This optimization can increase the size of the mem init file,
+                    // because ctors can write to memory that would otherwise be
+                    // in a zeroinit area. This may not be a significant increase after
+                    // gzip, if there are mostly zeros in there, and in any case
+                    // the mem init increase would be offset by a code size decrease.
+                    // (Unless you have a small ctor that writes 'random' data to memory,
+                    // which would reduce little code but add potentially lots of
+                    // uncompressible data.)
+                    //
+                    // LLVM's GlobalOpt *almost* does this operation. It does in simple
+                    // cases, where LLVM IR is not too complex for its logic to evaluate,
+                    // but it isn't powerful enough for e.g. libc++ iostream ctors. It
+                    // is just hard to do at the LLVM IR level - LLVM IR is complex and
+                    // getting more complex, this would require GlobalOpt to have a full
+                    // interpreter, plus a way to write back into LLVM IR global objects.
+                    // At the asm.js level, however, everything has been lowered into a
+                    // simple low level, and we also just need to write bytes into an
+                    // array, so this is easy for us to do, but not for LLVM. A further
+                    // issue for LLVM is that it doesn't know that we will not link in
+                    // further code, so it only tries to optimize ctors with lowest
+                    // priority. We do know that, and can optimize all the ctors.
+
+var CYBERDWARF = 0; // see http://kripken.github.io/emscripten-site/docs/debugging/CyberDWARF.html
+
+var BUNDLED_CD_DEBUG_FILE = ""; // Path to the CyberDWARF debug file passed to the compiler
+
+var TEXTDECODER = 1; // Is enabled, use the JavaScript TextDecoder API for string marshalling.
+                     // Enabled by default, set this to 0 to disable.
+var OFFSCREENCANVAS_SUPPORT = 0; // If set to 1, enables support for transferring canvases to pthreads and creating WebGL contexts in them,
+                                 // as well as explicit swap control for GL contexts. This needs browser support for the OffscreenCanvas
+                                 // specification.
 
 // Reserved: variables containing POINTER_MASKING.
